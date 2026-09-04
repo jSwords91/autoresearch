@@ -178,6 +178,87 @@ def _deletion_tolerance(model, teacher, tokenizer, n_seqs=4):
     return cost
 
 
+REPAIR_SECONDS = 240
+REPAIR_LR = 1e-4
+REPAIR_BATCH = 2
+REPAIR_SEQ = 512
+
+
+def _packed_batches(tokenizer, device, seq_len, batch_size):
+    """Stream wikitext-103 train, tokenize, and pack into full fixed-length
+    blocks. Packing rather than padding means no token of the budget is
+    spent on padding, which matters when the budget is the binding
+    constraint."""
+    from datasets import load_dataset
+    ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1",
+                      split="train", streaming=True)
+    buf, batch = [], []
+    for row in ds:
+        text = row["text"].strip()
+        if len(text) < 200:
+            continue
+        buf.extend(tokenizer(text, add_special_tokens=False).input_ids)
+        while len(buf) >= seq_len:
+            batch.append(buf[:seq_len])
+            buf = buf[seq_len:]
+            if len(batch) == batch_size:
+                yield torch.tensor(batch, device=device)
+                batch = []
+
+
+def _repair_locally(model, teacher, tokenizer, neighbours):
+    """Distil the deleted layer's neighbours back into agreement with the
+    teacher, training ONLY those layers.
+
+    Two ideas make this affordable where a previous session's attempts were
+    not. First, the damage is local - one layer was removed, so its
+    neighbours are what must absorb its function - and training ~2 layers
+    instead of 32 cuts optimizer state and gradient memory enough to afford
+    a real batch size. Second, the objective is KL against the teacher's
+    full distribution rather than next-token loss on raw text, which is a
+    far richer signal per token, and tokens are precisely the scarce
+    resource here.
+    """
+    import bitsandbytes as bnb
+    import torch.nn.functional as F
+
+    for p_ in model.parameters():
+        p_.requires_grad_(False)
+    trainable = []
+    for idx in neighbours:
+        for p_ in model.model.layers[idx].parameters():
+            p_.requires_grad_(True)
+            trainable.append(p_)
+    n_params = sum(p_.numel() for p_ in trainable)
+
+    device = next(model.parameters()).device
+    model.train()
+    opt = bnb.optim.PagedAdamW8bit(trainable, lr=REPAIR_LR)
+
+    t0, steps, tokens = time.time(), 0, 0
+    for ids in _packed_batches(tokenizer, device, REPAIR_SEQ, REPAIR_BATCH):
+        with torch.no_grad():
+            t_logits = teacher(ids).logits.float()
+        s_logits = model(ids).logits.float()
+        t_lp = F.log_softmax(t_logits, dim=-1)
+        s_lp = F.log_softmax(s_logits, dim=-1)
+        loss = (t_lp.exp() * (t_lp - s_lp)).sum(-1).mean()
+        loss.backward()
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+        steps += 1
+        tokens += ids.numel()
+        if time.time() - t0 > REPAIR_SECONDS:
+            break
+
+    model.eval()
+    for p_ in model.parameters():
+        p_.requires_grad_(False)
+    print(f"repair: {steps} steps, {tokens} tokens, {n_params/1e6:.1f}M trainable, "
+          f"final KL {loss.item():.4f}")
+    return model
+
+
 def compress(model, tokenizer):
     """Delete the layers that measurement says are cheapest to delete, then
     apply activation-aware scaling and 4-bit quantization to what is left.
@@ -214,6 +295,13 @@ def compress(model, tokenizer):
     model.config.num_hidden_layers = len(kept)
     if getattr(model.config, "layer_types", None) is not None:
         model.config.layer_types = model.config.layer_types[:len(kept)]
+
+    neighbours = sorted({max(0, drop[0] - 1), min(len(kept) - 1, drop[0])})
+    print(f"repairing neighbours: {neighbours}")
+    teacher = load_teacher()
+    _repair_locally(model, teacher, tokenizer, neighbours)
+    del teacher
+    torch.cuda.empty_cache()
 
     acts = _norm_input_acts(model, tokenizer)
     _apply_awq_scaling(model, acts)
