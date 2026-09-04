@@ -176,6 +176,71 @@ def load_teacher():
     return model
 
 
+def load_checkpoint(model_dir):
+    """Load a saved checkpoint back off disk, the way a downstream user
+    would. `torch_dtype="auto"` honours the dtype recorded in config.json;
+    quantized checkpoints carry a quantization_config that dictates their own
+    dtype and placement, so they are loaded through device_map instead."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    with open(os.path.join(model_dir, "config.json")) as f:
+        cfg = json.load(f)
+
+    if "quantization_config" in cfg:
+        model = AutoModelForCausalLM.from_pretrained(model_dir, device_map="auto")
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_dir, torch_dtype="auto")
+        model.to(device)
+    model.eval()
+    return model
+
+
+_WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth")
+
+
+def _dir_files(d):
+    """Relative path -> size for every file under a directory."""
+    out = {}
+    for root, _, files in os.walk(d):
+        for f in files:
+            path = os.path.join(root, f)
+            out[os.path.relpath(path, d)] = os.path.getsize(path)
+    return out
+
+
+def assert_checkpoint_parity(model_dir):
+    """Refuse to score a checkpoint whose file set is not comparable to the
+    baseline's.
+
+    size_mb sums every file in a directory, so a checkpoint that omits the
+    tokenizer is credited several free MB against a baseline directory that
+    includes it (tokenizer.json alone is 3.4MB here, about 1.3% of a 4-bit
+    checkpoint). Worse, a directory containing no weights at all would score
+    a near-infinite compression ratio: an earlier crashed run left behind a
+    directory holding nothing but config.json and generation_config.json,
+    which would have been measured as a ~680,000x compression.
+
+    Neither failure is a property of the compressed model, so both raise
+    rather than failing the gate - the experiment is invalid, not merely bad.
+    """
+    baseline_files = _dir_files(MODEL_CACHE_DIR)
+    ckpt_files = _dir_files(model_dir)
+
+    required = {f for f in baseline_files if not f.endswith(_WEIGHT_SUFFIXES)}
+    missing = sorted(required - set(ckpt_files))
+    if missing:
+        raise RuntimeError(
+            f"checkpoint {model_dir} is missing files present in the baseline: "
+            f"{missing}. size_mb would not be comparable. Save the tokenizer "
+            f"and config alongside the weights."
+        )
+
+    if not [f for f in ckpt_files if f.endswith(_WEIGHT_SUFFIXES)]:
+        raise RuntimeError(
+            f"checkpoint {model_dir} contains no weight files "
+            f"({'/'.join(_WEIGHT_SUFFIXES)}); there is no model here to score."
+        )
+
+
 def _model_device(model):
     """Infer the model's device rather than assuming one, so eval works no
     matter what device a compression technique leaves the model on (e.g.
@@ -447,11 +512,20 @@ def measure_latency(model, tokenizer, prompt="The quick brown fox jumps over the
     return n_generated / dt
 
 
-def evaluate_checkpoint(model, tokenizer, model_dir, corpus=None):
+def evaluate_checkpoint(tokenizer, model_dir, corpus=None):
     """
     Single entry point compress.py calls. Returns every metric needed to
     apply the quality gate and log results.tsv. DO NOT CHANGE the
     definitions of the individual metric functions above.
+
+    The model is RELOADED FROM model_dir and that reloaded model is what
+    gets scored. Scoring an in-memory object while separately measuring a
+    directory's size would let the quality numbers and the size number refer
+    to different artifacts - and size on disk is the objective, so the two
+    halves of "quality per byte" must describe the same thing. Reloading
+    also means a technique that produces an unloadable checkpoint fails
+    loudly here rather than being scored on a model that only ever existed
+    in memory.
 
     Ordering matters and is deliberate: everything needing the teacher runs
     first, then the teacher is freed, and only then is throughput measured.
@@ -464,6 +538,9 @@ def evaluate_checkpoint(model, tokenizer, model_dir, corpus=None):
     `corpus` is rebuilt here if not supplied; pass it in to avoid
     re-streaming the datasets.
     """
+    assert_checkpoint_parity(model_dir)
+    model = load_checkpoint(model_dir)
+
     if corpus is None:
         corpus = _fidelity_corpus(tokenizer)
 
@@ -594,9 +671,9 @@ if __name__ == "__main__":
         print("Baseline: evaluating the unmodified model against itself.")
         print("Agreement must come out at exactly 1.0 and KL at 0.0 by definition,")
         print("so this doubles as a self-test that the harness is wired up correctly.")
-        model, tokenizer = load_baseline()
+        _, tokenizer = load_baseline()
         corpus = _fidelity_corpus(tokenizer)
-        metrics = evaluate_checkpoint(model, tokenizer, MODEL_CACHE_DIR, corpus=corpus)
+        metrics = evaluate_checkpoint(tokenizer, MODEL_CACHE_DIR, corpus=corpus)
         os.makedirs(CACHE_DIR, exist_ok=True)
         with open(BASELINE_METRICS_PATH, "w") as f:
             json.dump({k: v for k, v in metrics.items() if k != "gen_sanity_details"}, f, indent=2)

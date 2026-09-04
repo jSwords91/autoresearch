@@ -111,11 +111,23 @@ def main():
 
     commit = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"]).decode().strip()
     out_dir = os.path.join(CHECKPOINTS_DIR, commit)
+
+    # Start from a clean directory. out_dir is keyed by commit, so re-running
+    # at the same commit would otherwise leave orphaned files from the
+    # previous attempt (a stale extra shard, say) counting toward size_mb.
+    shutil.rmtree(out_dir, ignore_errors=True)
     os.makedirs(out_dir, exist_ok=True)
     model.save_pretrained(out_dir, safe_serialization=True)
     tokenizer.save_pretrained(out_dir)
 
-    metrics = evaluate_checkpoint(model, tokenizer, out_dir)
+    # Drop the in-memory model: evaluate_checkpoint reloads from disk, so the
+    # thing scored is the same artifact whose bytes we are counting. Freeing
+    # it here also keeps peak VRAM down, since eval loads a teacher too.
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    metrics = evaluate_checkpoint(tokenizer, out_dir)
 
     with open(BASELINE_METRICS_PATH) as f:
         baseline = json.load(f)
