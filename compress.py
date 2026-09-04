@@ -49,7 +49,8 @@ t_start = time.time()
 # so it is the one plain AWQ implementations usually skip.
 
 ALPHA = 0.5
-SCALE_DOWN_PROJ = True
+SCALE_DOWN_PROJ = False
+DOUBLE_QUANT = True
 
 
 def _norm_input_acts(model, tokenizer, n_seqs=8):
@@ -136,7 +137,7 @@ def compress(model, tokenizer):
 
     acts = _norm_input_acts(model, tokenizer)
     n = _apply_awq_scaling(model, acts)
-    print(f"awq: rescaled {n} projections, alpha={ALPHA}, down_proj={SCALE_DOWN_PROJ}")
+    print(f"awq: rescaled {n} projections, alpha={ALPHA}, down_proj={SCALE_DOWN_PROJ}, dq={DOUBLE_QUANT}")
 
     tmp = os.path.join(CACHE_DIR, "_awq_tmp")
     _sh.rmtree(tmp, ignore_errors=True)
@@ -153,6 +154,7 @@ def compress(model, tokenizer):
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=DOUBLE_QUANT,
         ),
         device_map="auto",
     )
