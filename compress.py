@@ -130,7 +130,12 @@ def compress(model, tokenizer):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    skip = [f"model.layers.{i}" for i in protect]
+    # lm_head must stay out of the skip list's blast radius: passing
+    # llm_int8_skip_modules REPLACES the list transformers would otherwise
+    # derive automatically, which normally protects tied output embeddings.
+    # Quantizing lm_head here breaks its tie to embed_tokens and the packed
+    # 4-bit param fails to round-trip through save/reload.
+    skip = [f"model.layers.{i}" for i in protect] + ["lm_head"]
     return AutoModelForCausalLM.from_pretrained(
         MODEL_CACHE_DIR,
         quantization_config=BitsAndBytesConfig(
