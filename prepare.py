@@ -39,6 +39,7 @@ Model, data, and baseline metrics are stored in ~/.cache/autoresearch-compress/.
 
 import os
 import json
+import math
 import time
 import string
 import argparse
@@ -642,17 +643,53 @@ def compression_ratio(metrics, baseline):
     return baseline["size_mb"] / metrics["size_mb"]
 
 
+def fidelity(metrics):
+    """One number for "how much of the original model survived", combining
+    all three views of agreement.
+
+    An earlier version of this harness ranked on top1_agreement alone and
+    called that the fidelity axis. That was wrong in a way the experiments
+    exposed: dropping down_proj scaling produced a run with better KL and
+    much better free-running agreement (0.636 vs 0.525) which nonetheless
+    counted as *dominated*, because the one view being ranked happened to
+    disagree with the other two. The axis could not see a trade the data
+    plainly contained.
+
+    Adding all three as separate Pareto axes is not the fix - with five axes
+    almost nothing dominates anything and the frontier becomes the whole
+    set. So the three views collapse into one fidelity score, and the
+    remaining axes stay genuinely distinct concerns: size, quality, latency.
+
+    Geometric mean, for three reasons: it needs no invented exchange rate
+    between the views, it is scale-invariant across them, and unlike an
+    arithmetic mean it refuses to let a good score on one view paper over a
+    bad score on another. KL enters as exp(-KL), which is not an arbitrary
+    squashing - with KL in nats, exp(-KL) is the geometric-mean probability
+    ratio the compressed model assigns relative to the original, so all
+    three factors are then on the same "fraction of the original retained"
+    footing.
+    """
+    views = (
+        metrics["top1_agreement"],
+        metrics["gen_agreement"],
+        math.exp(-metrics["kl_div"]),
+    )
+    prod = 1.0
+    for v in views:
+        prod *= max(v, 1e-9)
+    return prod ** (1.0 / len(views))
+
+
 def frontier_point(metrics, baseline):
     """The three axes an experiment is ranked on, all higher-is-better.
 
     Compression is what we are buying; fidelity and speed are what we pay
-    with. Collapsing these into one scalar would bake in an exchange rate
-    nobody has justified, so they stay separate and ranking is by Pareto
-    dominance instead.
+    with. These stay separate rather than being collapsed into one scalar,
+    because doing that would bake in an exchange rate nobody has justified.
     """
     return {
         "compression_ratio": compression_ratio(metrics, baseline),
-        "top1_agreement": metrics["top1_agreement"],
+        "fidelity": fidelity(metrics),
         "speed_ratio": speed_ratio(metrics, baseline),
     }
 
@@ -660,7 +697,7 @@ def frontier_point(metrics, baseline):
 def dominates(a, b):
     """True if frontier point `a` is at least as good as `b` on every axis
     and strictly better on at least one."""
-    keys = ("compression_ratio", "top1_agreement", "speed_ratio")
+    keys = ("compression_ratio", "fidelity", "speed_ratio")
     return all(a[k] >= b[k] for k in keys) and any(a[k] > b[k] for k in keys)
 
 

@@ -17,7 +17,7 @@ import torch
 from prepare import (
     CHECKPOINTS_DIR, BASELINE_METRICS_PATH, TIME_BUDGET,
     load_baseline, evaluate_checkpoint, passes_quality_gate, compression_ratio,
-    speed_ratio,
+    speed_ratio, fidelity,
 )
 
 t_start = time.time()
@@ -150,6 +150,7 @@ def main():
     print(f"lambada_acc:       {metrics['lambada_acc']:.4f}")
     print(f"tokens_per_sec:    {metrics['tokens_per_sec']:.1f}")
     print(f"speed_ratio:       {spd:.3f}")
+    print(f"fidelity:          {fidelity(metrics):.4f}")
     print(f"peak_vram_mb:      {peak_vram_mb:.1f}")
     print(f"quality_gate:      {'PASS' if gate_ok else 'FAIL'}")
     print(f"total_seconds:     {elapsed:.1f}")
