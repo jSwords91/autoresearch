@@ -1,389 +1,611 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+One-time setup and fixed evaluation harness for autoresearch-compress.
+
+Downloads the baseline pretrained model + eval corpora, computes and caches
+baseline metrics, and exposes the ground-truth evaluation functions used by
+compress.py.
+
+The evaluation is built around one idea: compression has a privileged
+reference that general model evaluation does not - the original model. The
+question is not "is the compressed model good", it is "is it the same as
+this specific frozen artifact". Measuring absolute quality (perplexity,
+benchmark accuracy) conflates the teacher's own errors with damage we
+caused; measuring agreement with the teacher isolates the damage.
+
+Agreement is measured at three levels of strictness, which correspond to
+three distinct ways a compressed model can be wrong:
+
+  1. top1_agreement  - does it emit the same token? (behavioural: this is
+                       what a user sees under greedy decoding)
+  2. kl_div          - does it hold the same distribution? (catches loss of
+                       confidence/calibration that top-1 hides, and which
+                       shows up under sampling)
+  3. gen_agreement   - does it still say the same thing when running free?
+                       (both metrics above are teacher-forced and therefore
+                       blind to compounding error)
+
+plus a degeneration check (repetition loops etc.), and two cost axes that
+are reported and gated: size on disk and generation throughput. Throughput
+is gated because a "compressed" model that is several times slower is not
+obviously a win, and an objective that only counts bytes will happily buy
+size with speed.
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
+    python prepare.py                  # full setup: download + baseline eval
+    python prepare.py --force-baseline # recompute baseline metrics
 
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+Model, data, and baseline metrics are stored in ~/.cache/autoresearch-compress/.
 """
 
 import os
-import sys
+import json
 import time
-import math
+import string
 import argparse
-import pickle
-from multiprocessing import Pool
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
 import torch
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from datasets import load_dataset
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+MODEL_ID = "HuggingFaceTB/SmolLM2-360M-Instruct"
+
+TIME_BUDGET = 600  # compression experiment time budget in seconds (10 minutes):
+                    # compress() + optional recovery + save + eval, wall clock
+
+# --- Quality gate ----------------------------------------------------------
+# The gate detects BREAKAGE. It does not measure value. Those are different
+# questions and conflating them was the flaw in the previous harness: a
+# single tight bar produced 17 undifferentiated FAILs across a whole session
+# and no way to rank them, which gave the search nothing to climb.
+#
+# So: the gate answers "is this model broken?" and is deliberately loose.
+# Ranking among non-broken experiments is done on the frontier - compression
+# ratio against top1_agreement, kl_div and speed_ratio - which is why those
+# are reported for every run whether it passes or not.
+#
+# Thresholds are calibrated from measured behaviour, not chosen as round
+# numbers. Reference points on SmolLM2-360M-Instruct:
+#
+#   technique   compress  top1    kl      gen_agr  sanity  speed
+#   8-bit bnb   1.757x    0.9116  0.0277  0.6867   1.000   0.213
+#   4-bit NF4   2.643x    0.8055  0.1516  0.5339   0.917   0.882
+#
+# 4-bit emits a visible repetition loop, so real breakage sits somewhere
+# between KL 0.03 and 0.15 for this model. gen_sanity catches that case
+# directly, so KL_CEILING is set well above it as a backstop for
+# catastrophic distribution damage (the structural-surgery failures from the
+# previous harness were an order of magnitude worse than either row above).
+#
+# top1_agreement and gen_agreement are NOT gated. Free-running agreement in
+# particular is inherently low even for good compressions, because greedy
+# decoding is chaotic: one different token cascades through everything after
+# it. They are frontier axes, not pass/fail criteria.
+
+KL_CEILING = 0.25               # backstop for catastrophic distribution damage
+GEN_SANITY_TOLERANCE_ABS = 0.0  # degeneration rate must not regress at all
+SPEED_FLOOR_RATIO = 0.80        # reject techniques that buy size with speed;
+                                # bnb int8's dequant overhead lands at 0.213
+
+# --- Eval set sizes --------------------------------------------------------
+# The fidelity corpus is deliberately mixed: chat-formatted conversations
+# (the model is instruction-tuned, so that is the distribution that matters)
+# and general prose (catches damage that only shows up on long-form text).
+# Every sequence contributes hundreds of token positions, so these small
+# counts still yield tens of thousands of measurements - far denser than a
+# few hundred binary accuracy outcomes.
+FIDELITY_CHAT_SEQS = 40
+FIDELITY_PROSE_SEQS = 40
+FIDELITY_MAX_LEN = 512
+
+GEN_MAX_NEW_TOKENS = 128     # cap on generated tokens for the sanity suite
+GEN_AGREEMENT_TOKENS = 64    # tokens to free-run when comparing against teacher
+LAMBADA_EVAL_EXAMPLES = 150  # reported for legibility, NOT gated (see below)
+
+_REPEAT_NGRAM_N = 4            # n-gram size used by the degenerate-output detector
+_REPEAT_NGRAM_MAX_RATIO = 0.5  # flag as degenerate if >50% of n-grams repeat
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch-compress")
+MODEL_CACHE_DIR = os.path.join(CACHE_DIR, "baseline-model")
+BASELINE_METRICS_PATH = os.path.join(CACHE_DIR, "baseline.json")
+CHECKPOINTS_DIR = os.path.join(CACHE_DIR, "checkpoints")
 
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
+# Fixed instruction-prompt suite. Deliberately varied (facts, formatting,
+# arithmetic, translation) so a technique that breaks one narrow capability
+# still gets caught. Used for both the degeneration check and the
+# free-running agreement check.
+SANITY_PROMPTS = [
+    "What is the capital of France?",
+    "Write a haiku about the ocean.",
+    "List three primary colors.",
+    "Reverse the word 'hello'.",
+    "What is 12 plus 7?",
+    "Name one planet in the solar system.",
+    "Complete the sentence: The sky is",
+    "Give a one-sentence summary of what a computer is.",
+    "What is the opposite of 'hot'?",
+    "Translate 'good morning' to French.",
+    "Count from 1 to 5.",
+    "What day comes after Monday?",
+]
 
 # ---------------------------------------------------------------------------
-# Data download
+# Model / tokenizer loading
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
-
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
-
-
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
-
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
+def download_baseline():
+    """One-time download of the baseline model + tokenizer into the cache dir."""
+    if os.path.exists(os.path.join(MODEL_CACHE_DIR, "config.json")):
+        print(f"Model: already cached at {MODEL_CACHE_DIR}")
         return
-
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
-
-# ---------------------------------------------------------------------------
-# Tokenizer training
-# ---------------------------------------------------------------------------
-
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+    print(f"Model: downloading {MODEL_ID}...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)
+    os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
+    tokenizer.save_pretrained(MODEL_CACHE_DIR)
+    model.save_pretrained(MODEL_CACHE_DIR)
+    print(f"Model: saved to {MODEL_CACHE_DIR}")
 
 
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+def load_baseline():
+    """Load the cached baseline model + tokenizer onto the best available device."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_CACHE_DIR)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_CACHE_DIR, torch_dtype=DTYPE)
+    model.to(device)
+    model.eval()
+    return model, tokenizer
 
 
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+def load_teacher():
+    """Load a second, frozen copy of the baseline to compare against. This is
+    the reference the whole evaluation is defined relative to."""
+    model, _ = load_baseline()
+    for p in model.parameters():
+        p.requires_grad = False
+    return model
 
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
 
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
-
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
-
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
-
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
-    )
-
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
-
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
-
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
-
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
+def _model_device(model):
+    """Infer the model's device rather than assuming one, so eval works no
+    matter what device a compression technique leaves the model on (e.g.
+    CPU-only dynamic quantization)."""
+    return next(model.parameters()).device
 
 # ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
+# Eval data
 # ---------------------------------------------------------------------------
 
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
+def _fidelity_corpus(tokenizer):
+    """Mixed chat + prose corpus, tokenized. Returns a list of 1 x T id tensors.
 
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
-
-
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
-
-
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
-
-
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+    Chat sequences use the model's own chat template because the baseline is
+    instruction-tuned: that is the distribution we actually care about
+    preserving. Prose sequences catch damage that only shows on long-form
+    text. Uses held-out splits so a recovery fine-tune training on the
+    corresponding train splits does not leak into the gate.
     """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
-    """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
+    seqs = []
 
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
+    chat = load_dataset("HuggingFaceH4/no_robots", split="test", streaming=True)
+    for row in chat:
+        encoded = tokenizer.apply_chat_template(
+            row["messages"], return_tensors="pt", truncation=True,
+            max_length=FIDELITY_MAX_LEN, return_dict=True,
+        )
+        ids = encoded["input_ids"]
+        if ids.size(1) >= 32:
+            seqs.append(ids)
+        if len(seqs) >= FIDELITY_CHAT_SEQS:
+            break
 
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+    n_chat = len(seqs)
+    prose = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
+    for row in prose:
+        text = row["text"].strip()
+        if len(text) < 500:
+            continue
+        ids = tokenizer(text, return_tensors="pt", truncation=True,
+                        max_length=FIDELITY_MAX_LEN).input_ids
+        if ids.size(1) >= 32:
+            seqs.append(ids)
+        if len(seqs) - n_chat >= FIDELITY_PROSE_SEQS:
+            break
 
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
+    return seqs
 
-                remaining = row_capacity - pos
 
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
-
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
+def _lambada_examples():
+    ds = load_dataset("EleutherAI/lambada_openai", "default", split="test")
+    return [row["text"] for row in ds][:LAMBADA_EVAL_EXAMPLES]
 
 # ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
+# Evaluation (DO NOT CHANGE - these are the ground-truth metrics)
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+def compute_fidelity(model, teacher, corpus):
     """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
+    Teacher-forced agreement between the compressed model and the frozen
+    baseline, at two levels of strictness.
+
+    top1_agreement: fraction of positions where both models' argmax matches.
+    Directly interpretable and behaviourally meaningful - it is exactly what
+    determines greedy-decode output.
+
+    kl_div: mean forward KL(teacher || student) in nats per token. Forward
+    (mode-covering) is the correct direction for compression: we want the
+    student to reproduce everything the teacher would say, not merely find
+    one mode of it. Catches loss of confidence that top-1 agreement is blind
+    to.
+
+    Every sequence contributes hundreds of positions, so this is a far denser
+    measurement than any accuracy metric at comparable cost.
     """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
+    device = _model_device(model)
+    t_device = _model_device(teacher)
+
+    n_positions = 0
+    n_agree = 0
+    kl_total = 0.0
+
+    for ids in corpus:
+        s_logits = model(ids.to(device)).logits.float()
+        t_logits = teacher(ids.to(t_device)).logits.float().to(s_logits.device)
+
+        # drop the final position: it predicts a token we do not have
+        s_logits = s_logits[0, :-1, :]
+        t_logits = t_logits[0, :-1, :]
+        if s_logits.size(0) == 0:
+            continue
+
+        n_agree += (s_logits.argmax(-1) == t_logits.argmax(-1)).sum().item()
+
+        t_logprob = F.log_softmax(t_logits, dim=-1)
+        s_logprob = F.log_softmax(s_logits, dim=-1)
+        kl = (t_logprob.exp() * (t_logprob - s_logprob)).sum(-1)
+        kl_total += kl.sum().item()
+
+        n_positions += s_logits.size(0)
+
+    return {
+        "top1_agreement": n_agree / n_positions if n_positions else 0.0,
+        "kl_div": kl_total / n_positions if n_positions else float("inf"),
+        "fidelity_positions": n_positions,
+    }
+
+
+@torch.no_grad()
+def compute_generation_agreement(model, teacher, tokenizer, prompts=None):
+    """
+    Free-running agreement: generate greedily from both models on the same
+    prompts and measure how long they stay identical.
+
+    Teacher-forced metrics cannot see compounding error - a model can match
+    the teacher at 99% of positions when fed ground truth, then diverge into
+    garbage once it starts consuming its own output. This is the metric that
+    catches that. Score is the mean normalised prefix length before
+    divergence (1.0 = identical generations).
+    """
+    device = _model_device(model)
+    t_device = _model_device(teacher)
+    prompts = prompts if prompts is not None else SANITY_PROMPTS
+
+    scores = []
+    for prompt in prompts:
+        messages = [{"role": "user", "content": prompt}]
+        encoded = tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, return_tensors="pt", return_dict=True
+        )
+        ids = encoded["input_ids"]
+        n_prompt = ids.size(1)
+
+        try:
+            s_gen = model.generate(
+                ids.to(device), max_new_tokens=GEN_AGREEMENT_TOKENS,
+                do_sample=False, pad_token_id=tokenizer.eos_token_id,
+            )[0, n_prompt:].tolist()
+            t_gen = teacher.generate(
+                ids.to(t_device), max_new_tokens=GEN_AGREEMENT_TOKENS,
+                do_sample=False, pad_token_id=tokenizer.eos_token_id,
+            )[0, n_prompt:].tolist()
+        except RuntimeError:
+            scores.append(0.0)
+            continue
+
+        match = 0
+        for s_tok, t_tok in zip(s_gen, t_gen):
+            if s_tok != t_tok:
+                break
+            match += 1
+        scores.append(match / max(len(t_gen), 1))
+
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def _is_degenerate(text, n=_REPEAT_NGRAM_N, max_ratio=_REPEAT_NGRAM_MAX_RATIO):
+    words = text.split()
+    if len(words) < n + 1:
+        return False
+    ngrams = [tuple(words[i:i + n]) for i in range(len(words) - n + 1)]
+    unique_ratio = len(set(ngrams)) / len(ngrams)
+    return unique_ratio < (1 - max_ratio)
+
+
+@torch.no_grad()
+def run_generation_sanity(model, tokenizer, prompts=None):
+    """
+    Absolute (not comparative) check that output has not collapsed: non-empty,
+    non-degenerate, and generate() did not raise. Catches repetition loops,
+    which are the classic way a quantized model breaks.
+    """
+    device = _model_device(model)
+    prompts = prompts if prompts is not None else SANITY_PROMPTS
+    results = []
+    for prompt in prompts:
+        messages = [{"role": "user", "content": prompt}]
+        encoded = tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, return_tensors="pt", return_dict=True
+        )
+        input_ids = encoded["input_ids"].to(device)
+        try:
+            gen = model.generate(
+                input_ids,
+                max_new_tokens=GEN_MAX_NEW_TOKENS,
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        except RuntimeError as e:
+            results.append({"prompt": prompt, "ok": False, "reason": f"generate() raised: {e}"})
+            continue
+        completion = tokenizer.decode(gen[0, input_ids.size(1):], skip_special_tokens=True)
+        ok = bool(completion.strip()) and not _is_degenerate(completion)
+        results.append({"prompt": prompt, "ok": ok, "completion": completion[:200]})
+    pass_rate = sum(r["ok"] for r in results) / len(results)
+    return {"pass_rate": pass_rate, "details": results}
+
+
+@torch.no_grad()
+def compute_lambada_accuracy(model, tokenizer, examples=None):
+    """
+    LAMBADA last-word cloze accuracy. Reported for human legibility (it is a
+    number people have intuitions about) but deliberately NOT part of the
+    quality gate: a few hundred binary outcomes cannot resolve the
+    differences we care about, and agreement-with-teacher already covers
+    capability preservation far more densely.
+    """
+    device = _model_device(model)
+    examples = examples if examples is not None else _lambada_examples()
+    correct = 0
+    total = 0
+    for text in examples:
+        text = text.strip()
+        if " " not in text:
+            continue
+        context, target = text.rsplit(" ", 1)
+        target_ids = tokenizer(" " + target, add_special_tokens=False).input_ids
+        if not target_ids:
+            continue
+        input_ids = tokenizer(context, return_tensors="pt", truncation=True, max_length=1024).input_ids.to(device)
+        gen = model.generate(
+            input_ids,
+            max_new_tokens=len(target_ids),
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+        completion = tokenizer.decode(gen[0, input_ids.size(1):], skip_special_tokens=True)
+        predicted_words = completion.strip().split()
+        predicted_word = predicted_words[0].strip(string.punctuation) if predicted_words else ""
+        target_word = target.strip(string.punctuation)
+        if predicted_word == target_word:
+            correct += 1
+        total += 1
+    return correct / total if total else 0.0
+
+
+def measure_size_mb(model_dir):
+    """On-disk size of a saved checkpoint directory (weights + config), in MB.
+    Deliberately size-on-disk rather than parameter count: it is the one
+    metric that is honest across quantization, structured pruning, and
+    distillation alike. Note that UNSTRUCTURED pruning alone does not shrink
+    this number unless the result is serialized in a genuinely sparse format
+    - see program.md."""
     total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+    for root, _, files in os.walk(model_dir):
+        for f in files:
+            total_bytes += os.path.getsize(os.path.join(root, f))
+    return total_bytes / (1024 * 1024)
+
+
+@torch.no_grad()
+def measure_latency(model, tokenizer, prompt="The quick brown fox jumps over the lazy dog. ", max_new_tokens=100, warmup=1):
+    """Tokens/sec for greedy generation on a fixed prompt. GATED, not merely
+    logged: a technique that buys size by making inference dramatically
+    slower has not compressed anything useful."""
+    device = _model_device(model)
+    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+    for _ in range(warmup):
+        model.generate(input_ids, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    t0 = time.time()
+    gen = model.generate(input_ids, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    dt = time.time() - t0
+    n_generated = gen.size(1) - input_ids.size(1)
+    return n_generated / dt
+
+
+def evaluate_checkpoint(model, tokenizer, model_dir, corpus=None):
+    """
+    Single entry point compress.py calls. Returns every metric needed to
+    apply the quality gate and log results.tsv. DO NOT CHANGE the
+    definitions of the individual metric functions above.
+
+    Ordering matters and is deliberate: everything needing the teacher runs
+    first, then the teacher is freed, and only then is throughput measured.
+    Otherwise the teacher's ~700MB sits on the GPU during the latency test
+    and depresses it, by an amount that varies with how big the compressed
+    model is - which would make a smaller model look faster purely because
+    it left more room. Since throughput is gated, that confound would
+    produce wrong verdicts.
+
+    `corpus` is rebuilt here if not supplied; pass it in to avoid
+    re-streaming the datasets.
+    """
+    if corpus is None:
+        corpus = _fidelity_corpus(tokenizer)
+
+    teacher = load_teacher()
+    fidelity = compute_fidelity(model, teacher, corpus)
+    gen_agreement = compute_generation_agreement(model, teacher, tokenizer)
+
+    del teacher
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # teacher-free from here: these measure the compressed model alone
+    sanity = run_generation_sanity(model, tokenizer)
+    lambada_acc = compute_lambada_accuracy(model, tokenizer)
+    size_mb = measure_size_mb(model_dir)
+
+    # Throughput is measured against a reference copy loaded RIGHT NOW,
+    # rather than against the figure cached in baseline.json. On a thermally
+    # throttled laptop GPU the absolute rate drifts enormously across a
+    # session (measured: 30 tok/s cold, 12 tok/s after hours of runs, as the
+    # SM clock drops from 2100MHz to 210MHz). A ratio only cancels that
+    # common-mode drift if both halves are measured in the same thermal
+    # state, seconds apart. Both are measured with both models resident so
+    # the memory footprint is symmetric too.
+    reference = load_teacher()
+    ref_tok_per_sec = measure_latency(reference, tokenizer)
+    tok_per_sec = measure_latency(model, tokenizer)
+    del reference
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return {
+        "reference_tokens_per_sec": ref_tok_per_sec,
+        "top1_agreement": fidelity["top1_agreement"],
+        "kl_div": fidelity["kl_div"],
+        "fidelity_positions": fidelity["fidelity_positions"],
+        "gen_agreement": gen_agreement,
+        "gen_sanity_pass_rate": sanity["pass_rate"],
+        "gen_sanity_details": sanity["details"],
+        "lambada_acc": lambada_acc,
+        "size_mb": size_mb,
+        "tokens_per_sec": tok_per_sec,
+    }
+
+
+def passes_quality_gate(metrics, baseline):
+    """Breakage detector. Returns (ok, reasons) so callers can report WHY
+    something failed rather than only that it did.
+
+    Passing means "not broken", NOT "good". Ranking among passing
+    experiments is done on the frontier - see rank_key()."""
+    reasons = []
+
+    if metrics["kl_div"] > KL_CEILING:
+        reasons.append(f"kl_div {metrics['kl_div']:.4f} > {KL_CEILING}")
+    if metrics["gen_sanity_pass_rate"] < baseline["gen_sanity_pass_rate"] - GEN_SANITY_TOLERANCE_ABS:
+        reasons.append(
+            f"gen_sanity {metrics['gen_sanity_pass_rate']:.3f} < "
+            f"{baseline['gen_sanity_pass_rate'] - GEN_SANITY_TOLERANCE_ABS:.3f}"
+        )
+    ratio = speed_ratio(metrics, baseline)
+    if ratio < SPEED_FLOOR_RATIO:
+        reasons.append(f"speed_ratio {ratio:.3f} < {SPEED_FLOOR_RATIO}")
+
+    return len(reasons) == 0, reasons
+
+
+def compression_ratio(metrics, baseline):
+    """The objective to maximize, once the quality gate passes."""
+    return baseline["size_mb"] / metrics["size_mb"]
+
+
+def frontier_point(metrics, baseline):
+    """The three axes an experiment is ranked on, all higher-is-better.
+
+    Compression is what we are buying; fidelity and speed are what we pay
+    with. Collapsing these into one scalar would bake in an exchange rate
+    nobody has justified, so they stay separate and ranking is by Pareto
+    dominance instead.
+    """
+    return {
+        "compression_ratio": compression_ratio(metrics, baseline),
+        "top1_agreement": metrics["top1_agreement"],
+        "speed_ratio": speed_ratio(metrics, baseline),
+    }
+
+
+def dominates(a, b):
+    """True if frontier point `a` is at least as good as `b` on every axis
+    and strictly better on at least one."""
+    keys = ("compression_ratio", "top1_agreement", "speed_ratio")
+    return all(a[k] >= b[k] for k in keys) and any(a[k] > b[k] for k in keys)
+
+
+def speed_ratio(metrics, baseline=None):
+    """Throughput relative to the uncompressed model. Above 1.0 means the
+    compressed model is also faster, which is the ideal outcome.
+
+    Uses the reference measured during the same run when available, since
+    the cached baseline figure was taken in a different thermal state and is
+    not comparable (see evaluate_checkpoint). `baseline` is accepted only as
+    a fallback for metrics dicts predating that change.
+    """
+    ref = metrics.get("reference_tokens_per_sec")
+    if not ref:
+        ref = baseline["tokens_per_sec"]
+    return metrics["tokens_per_sec"] / ref
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser = argparse.ArgumentParser(description="Prepare baseline model, data, and baseline metrics")
+    parser.add_argument("--force-baseline", action="store_true", help="Recompute baseline metrics even if cached")
     args = parser.parse_args()
 
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
-
     print(f"Cache directory: {CACHE_DIR}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
     print()
 
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
+    download_baseline()
     print()
 
-    # Step 2: Train tokenizer
-    train_tokenizer()
+    if os.path.exists(BASELINE_METRICS_PATH) and not args.force_baseline:
+        print(f"Baseline: already computed at {BASELINE_METRICS_PATH}")
+    else:
+        print("Baseline: evaluating the unmodified model against itself.")
+        print("Agreement must come out at exactly 1.0 and KL at 0.0 by definition,")
+        print("so this doubles as a self-test that the harness is wired up correctly.")
+        model, tokenizer = load_baseline()
+        corpus = _fidelity_corpus(tokenizer)
+        metrics = evaluate_checkpoint(model, tokenizer, MODEL_CACHE_DIR, corpus=corpus)
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(BASELINE_METRICS_PATH, "w") as f:
+            json.dump({k: v for k, v in metrics.items() if k != "gen_sanity_details"}, f, indent=2)
+        print(f"Baseline: saved to {BASELINE_METRICS_PATH}")
+        print()
+        print("---")
+        for k, v in metrics.items():
+            if k != "gen_sanity_details":
+                print(f"{k}: {v}")
+
     print()
-    print("Done! Ready to train.")
+    print("Done! Ready to compress. See program.md.")

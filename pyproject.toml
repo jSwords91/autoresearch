@@ -1,18 +1,17 @@
 [project]
-name = "autoresearch"
+name = "autoresearch-compress"
 version = "0.1.0"
-description = "Autonomous pretraining research swarm"
+description = "Autonomous post-training compression research swarm"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "kernels>=0.11.7",
-    "matplotlib>=3.10.8",
+    "accelerate>=1.1.0",
+    "bitsandbytes>=0.44.1",
+    "datasets>=3.1.0",
+    "huggingface-hub>=0.26.0",
     "numpy>=2.2.6",
-    "pandas>=2.3.3",
-    "pyarrow>=21.0.0",
-    "requests>=2.32.0",
-    "rustbpe>=0.1.0",
-    "tiktoken>=0.11.0",
+    "safetensors>=0.4.5",
+    "transformers>=4.46.0",
     "torch==2.9.1",
 ]
 
