@@ -49,7 +49,7 @@ t_start = time.time()
 # so it is the one plain AWQ implementations usually skip.
 
 ALPHA = 0.25
-SCALE_DOWN_PROJ = True
+SCALE_DOWN_PROJ = False
 DOUBLE_QUANT = True
 PROTECT_WORST = ["model.layers.31.mlp.down_proj"]
 
@@ -125,38 +125,105 @@ def _apply_awq_scaling(model, acts, alpha=ALPHA, scale_down=SCALE_DOWN_PROJ):
     return n_scaled
 
 
-def compress(model, tokenizer):
-    """Activation-aware scaling, then plain 4-bit NF4 everywhere.
+# --- Measured layer-deletion tolerance -------------------------------------
+# Which layers can actually be deleted? A previous session dropped tail
+# layers, watched the model collapse, and concluded layer removal does not
+# work on this architecture. That conclusion was never tested against the
+# alternative: the tail may simply be the worst possible choice. With a
+# frozen teacher and a KL metric we can just measure it - delete each layer
+# in turn, score the damage, and let the ranking decide.
+#
+# This is cheap because it needs no retraining and no rebuilds: removing a
+# module from a ModuleList and putting it back is free, and KL on a handful
+# of calibration sequences is a fraction of a second.
 
-    No bf16 protection at all - this keeps the full 2.64x of plain 4-bit and
-    tries to buy the fidelity back for free by rearranging what the quantizer
-    spends its resolution on.
+N_DROP = 2
+
+
+def _deletion_tolerance(model, teacher, tokenizer, n_seqs=4):
+    """Mean KL(teacher || model-without-layer-i) for every layer i."""
+    import torch.nn.functional as F
+    from datasets import load_dataset
+
+    device = next(model.parameters()).device
+    ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1",
+                      split="train", streaming=True)
+    calib, n = [], 0
+    for row in ds:
+        if len(row["text"].strip()) < 500:
+            continue
+        calib.append(tokenizer(row["text"].strip(), return_tensors="pt",
+                               truncation=True, max_length=384).input_ids.to(device))
+        n += 1
+        if n >= n_seqs:
+            break
+
+    with torch.no_grad():
+        t_logprobs = [F.log_softmax(teacher(ids).logits.float(), dim=-1) for ids in calib]
+
+    original = list(model.model.layers)
+    cost = {}
+    for i in range(len(original)):
+        kept = original[:i] + original[i + 1:]
+        model.model.layers = torch.nn.ModuleList(kept)
+        total, count = 0.0, 0
+        with torch.no_grad():
+            for ids, tlp in zip(calib, t_logprobs):
+                slp = F.log_softmax(model(ids).logits.float(), dim=-1)
+                kl = (tlp.exp() * (tlp - slp)).sum(-1)
+                total += kl.sum().item()
+                count += kl.numel()
+        cost[i] = total / count
+    model.model.layers = torch.nn.ModuleList(original)
+    return cost
+
+
+def compress(model, tokenizer):
+    """Delete the layers that measurement says are cheapest to delete, then
+    apply activation-aware scaling and 4-bit quantization to what is left.
+
+    Unlike quantization, removing a layer makes the model both smaller AND
+    faster, so if any layers are genuinely redundant this should beat
+    quantization alone on two axes at once.
     """
     import shutil as _sh
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
-    from prepare import MODEL_CACHE_DIR, CACHE_DIR
+    from prepare import MODEL_CACHE_DIR, CACHE_DIR, load_teacher
+
+    teacher = load_teacher()
+    cost = _deletion_tolerance(model, teacher, tokenizer)
+    del teacher
+    torch.cuda.empty_cache()
+
+    ranked = sorted(cost.items(), key=lambda kv: kv[1])
+    print(f"cheapest layers to delete: {[(i, round(c, 4)) for i, c in ranked[:6]]}")
+    print(f"most expensive:            {[(i, round(c, 4)) for i, c in ranked[-4:]]}")
+
+    drop = sorted(i for i, _ in ranked[:N_DROP])
+    print(f"deleting layers: {drop}")
+
+    kept = [l for i, l in enumerate(model.model.layers) if i not in drop]
+    model.model.layers = torch.nn.ModuleList(kept)
+    model.config.num_hidden_layers = len(kept)
+    if getattr(model.config, "layer_types", None) is not None:
+        model.config.layer_types = model.config.layer_types[:len(kept)]
 
     acts = _norm_input_acts(model, tokenizer)
-    n = _apply_awq_scaling(model, acts)
-    print(f"awq: rescaled {n} projections, alpha={ALPHA}, down_proj={SCALE_DOWN_PROJ}, dq={DOUBLE_QUANT}")
+    _apply_awq_scaling(model, acts)
 
     tmp = os.path.join(CACHE_DIR, "_awq_tmp")
     _sh.rmtree(tmp, ignore_errors=True)
     model.save_pretrained(tmp, safe_serialization=True)
     tokenizer.save_pretrained(tmp)
-
     del model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
 
     q = AutoModelForCausalLM.from_pretrained(
         tmp,
         quantization_config=BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=DOUBLE_QUANT,
-            llm_int8_skip_modules=PROTECT_WORST + ["lm_head"],
+            load_in_4bit=True, bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
+            llm_int8_skip_modules=["lm_head"],
         ),
         device_map="auto",
     )
