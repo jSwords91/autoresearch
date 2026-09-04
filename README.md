@@ -3,7 +3,7 @@
 A fork of [karpathy/autoresearch](https://github.com/karpathy/autoresearch),
 pointed at a different problem: instead of an AI agent pretraining a small
 GPT from scratch overnight, it takes an existing pretrained model
-(`Qwen/Qwen2.5-0.5B-Instruct`) and tries to compress it — quantization,
+(`HuggingFaceTB/SmolLM2-360M-Instruct`) and tries to compress it — quantization,
 pruning, low-rank factorization, distillation, or any combination — while
 keeping its behavior essentially unchanged.
 
@@ -107,4 +107,4 @@ pyproject.toml  — dependencies
 
 ## License
 
-MIT (inherited from upstream). Model weights (`Qwen/Qwen2.5-0.5B-Instruct`) are Apache 2.0, licensed separately by Alibaba/Qwen.
+MIT (inherited from upstream). Model weights (`HuggingFaceTB/SmolLM2-360M-Instruct`) are Apache 2.0, licensed separately by Hugging Face (SmolLM2).

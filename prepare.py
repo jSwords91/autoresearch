@@ -28,7 +28,7 @@ from datasets import load_dataset
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
+MODEL_ID = "HuggingFaceTB/SmolLM2-360M-Instruct"
 
 TIME_BUDGET = 600  # compression experiment time budget in seconds (10 minutes):
                     # compress() + optional recovery fine-tune + save + eval, wall clock

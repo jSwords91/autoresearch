@@ -2,7 +2,7 @@
 
 This is an experiment to have the LLM do its own research — but instead of
 pretraining a model from scratch, the agent starts from an existing
-pretrained checkpoint (`Qwen/Qwen2.5-0.5B-Instruct`) and tries to make it
+pretrained checkpoint (`HuggingFaceTB/SmolLM2-360M-Instruct`) and tries to make it
 smaller on disk while keeping its behavior essentially unchanged.
 
 ## Setup
