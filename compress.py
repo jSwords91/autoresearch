@@ -49,7 +49,7 @@ t_start = time.time()
 # so it is the one plain AWQ implementations usually skip.
 
 ALPHA = 0.5
-SCALE_DOWN_PROJ = False
+SCALE_DOWN_PROJ = True
 
 
 def _norm_input_acts(model, tokenizer, n_seqs=8):
