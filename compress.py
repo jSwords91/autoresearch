@@ -137,7 +137,7 @@ def _apply_awq_scaling(model, acts, alpha=ALPHA, scale_down=SCALE_DOWN_PROJ):
 # module from a ModuleList and putting it back is free, and KL on a handful
 # of calibration sequences is a fraction of a second.
 
-N_DROP = 2
+N_DROP = 1
 
 
 def _deletion_tolerance(model, teacher, tokenizer, n_seqs=4):
