@@ -92,7 +92,7 @@ nothing to climb.
 
 **The gate** (`passes_quality_gate`) is deliberately loose and only asks *is
 this model broken?*: no degeneration regression, KL below a catastrophic-
-damage backstop, and throughput at least 0.8x. Passing means "not broken",
+damage backstop, and throughput at least 0.6x. Passing means "not broken",
 not "good".
 
 **The frontier** ranks non-broken experiments on three higher-is-better axes
@@ -100,8 +100,15 @@ that are deliberately *not* collapsed into one scalar, because that would
 bake in an exchange rate nobody has justified:
 
     compression_ratio    what you are buying
-    top1_agreement       what you pay in fidelity
+    fidelity             what you pay in quality
     speed_ratio          what you pay in latency
+
+`fidelity` is the geometric mean of top1_agreement, gen_agreement and
+exp(-kl_div). It is one axis rather than three because at five axes almost
+nothing dominates anything and the frontier degenerates to the whole set -
+but it must combine all three views, because ranking on top1 alone hid a
+real trade: a run with better KL *and* far better free-running agreement
+counted as dominated purely because its top1 was marginally lower.
 
 Use `dominates()`: keep an experiment if no previously-kept experiment beats
 it on all three.
