@@ -3,8 +3,32 @@ One-time setup and fixed evaluation harness for autoresearch-compress.
 
 Downloads the baseline pretrained model + eval corpora, computes and caches
 baseline metrics, and exposes the ground-truth evaluation functions used by
-compress.py: bits-per-byte on held-out WikiText-2, LAMBADA cloze accuracy,
-a generation-sanity check, on-disk size, and generation throughput.
+compress.py.
+
+The evaluation is built around one idea: compression has a privileged
+reference that general model evaluation does not - the original model. The
+question is not "is the compressed model good", it is "is it the same as
+this specific frozen artifact". Measuring absolute quality (perplexity,
+benchmark accuracy) conflates the teacher's own errors with damage we
+caused; measuring agreement with the teacher isolates the damage.
+
+Agreement is measured at three levels of strictness, which correspond to
+three distinct ways a compressed model can be wrong:
+
+  1. top1_agreement  - does it emit the same token? (behavioural: this is
+                       what a user sees under greedy decoding)
+  2. kl_div          - does it hold the same distribution? (catches loss of
+                       confidence/calibration that top-1 hides, and which
+                       shows up under sampling)
+  3. gen_agreement   - does it still say the same thing when running free?
+                       (both metrics above are teacher-forced and therefore
+                       blind to compounding error)
+
+plus a degeneration check (repetition loops etc.), and two cost axes that
+are reported and gated: size on disk and generation throughput. Throughput
+is gated because a "compressed" model that is several times slower is not
+obviously a win, and an objective that only counts bytes will happily buy
+size with speed.
 
 Usage:
     python prepare.py                  # full setup: download + baseline eval
@@ -14,13 +38,13 @@ Model, data, and baseline metrics are stored in ~/.cache/autoresearch-compress/.
 """
 
 import os
-import math
 import json
 import time
 import string
 import argparse
 
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 
@@ -31,21 +55,58 @@ from datasets import load_dataset
 MODEL_ID = "HuggingFaceTB/SmolLM2-360M-Instruct"
 
 TIME_BUDGET = 600  # compression experiment time budget in seconds (10 minutes):
-                    # compress() + optional recovery fine-tune + save + eval, wall clock
+                    # compress() + optional recovery + save + eval, wall clock
 
-# Quality gate tolerances. An experiment fails the gate if ANY of these are
-# violated. See program.md for the full rationale.
-BPB_TOLERANCE = 0.01           # max allowed relative regression in wikitext2 bpb (1%)
-LAMBADA_TOLERANCE_ABS = 0.02   # max allowed absolute drop in lambada accuracy (2 points)
-GEN_SANITY_TOLERANCE_ABS = 0.0 # generation sanity pass rate must not regress at all vs baseline
+# --- Quality gate ----------------------------------------------------------
+# The gate detects BREAKAGE. It does not measure value. Those are different
+# questions and conflating them was the flaw in the previous harness: a
+# single tight bar produced 17 undifferentiated FAILs across a whole session
+# and no way to rank them, which gave the search nothing to climb.
+#
+# So: the gate answers "is this model broken?" and is deliberately loose.
+# Ranking among non-broken experiments is done on the frontier - compression
+# ratio against top1_agreement, kl_div and speed_ratio - which is why those
+# are reported for every run whether it passes or not.
+#
+# Thresholds are calibrated from measured behaviour, not chosen as round
+# numbers. Reference points on SmolLM2-360M-Instruct:
+#
+#   technique   compress  top1    kl      gen_agr  sanity  speed
+#   8-bit bnb   1.757x    0.9116  0.0277  0.6867   1.000   0.213
+#   4-bit NF4   2.643x    0.8055  0.1516  0.5339   0.917   0.882
+#
+# 4-bit emits a visible repetition loop, so real breakage sits somewhere
+# between KL 0.03 and 0.15 for this model. gen_sanity catches that case
+# directly, so KL_CEILING is set well above it as a backstop for
+# catastrophic distribution damage (the structural-surgery failures from the
+# previous harness were an order of magnitude worse than either row above).
+#
+# top1_agreement and gen_agreement are NOT gated. Free-running agreement in
+# particular is inherently low even for good compressions, because greedy
+# decoding is chaotic: one different token cascades through everything after
+# it. They are frontier axes, not pass/fail criteria.
 
-# Eval set sizes. Tunable down for faster iteration on smaller GPUs, tunable
-# up for a more reliable gate if you have time budget to spare.
-WIKITEXT_EVAL_DOCS = 200     # held-out wikitext-2 test docs used for bpb eval
-LAMBADA_EVAL_EXAMPLES = 300  # lambada test examples used for accuracy eval
-GEN_MAX_NEW_TOKENS = 128     # cap on generated tokens for the sanity-check suite
+KL_CEILING = 0.25               # backstop for catastrophic distribution damage
+GEN_SANITY_TOLERANCE_ABS = 0.0  # degeneration rate must not regress at all
+SPEED_FLOOR_RATIO = 0.80        # reject techniques that buy size with speed;
+                                # bnb int8's dequant overhead lands at 0.213
 
-_REPEAT_NGRAM_N = 4          # n-gram size used by the degenerate-output detector
+# --- Eval set sizes --------------------------------------------------------
+# The fidelity corpus is deliberately mixed: chat-formatted conversations
+# (the model is instruction-tuned, so that is the distribution that matters)
+# and general prose (catches damage that only shows up on long-form text).
+# Every sequence contributes hundreds of token positions, so these small
+# counts still yield tens of thousands of measurements - far denser than a
+# few hundred binary accuracy outcomes.
+FIDELITY_CHAT_SEQS = 40
+FIDELITY_PROSE_SEQS = 40
+FIDELITY_MAX_LEN = 512
+
+GEN_MAX_NEW_TOKENS = 128     # cap on generated tokens for the sanity suite
+GEN_AGREEMENT_TOKENS = 64    # tokens to free-run when comparing against teacher
+LAMBADA_EVAL_EXAMPLES = 150  # reported for legibility, NOT gated (see below)
+
+_REPEAT_NGRAM_N = 4            # n-gram size used by the degenerate-output detector
 _REPEAT_NGRAM_MAX_RATIO = 0.5  # flag as degenerate if >50% of n-grams repeat
 
 # ---------------------------------------------------------------------------
@@ -59,9 +120,10 @@ CHECKPOINTS_DIR = os.path.join(CACHE_DIR, "checkpoints")
 
 DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
-# Fixed instruction-prompt suite for the generation sanity check. Deliberately
-# varied (facts, formatting, arithmetic, translation) so a technique that
-# breaks one narrow capability still gets caught.
+# Fixed instruction-prompt suite. Deliberately varied (facts, formatting,
+# arithmetic, translation) so a technique that breaks one narrow capability
+# still gets caught. Used for both the degeneration check and the
+# free-running agreement check.
 SANITY_PROMPTS = [
     "What is the capital of France?",
     "Write a haiku about the ocean.",
@@ -105,6 +167,15 @@ def load_baseline():
     return model, tokenizer
 
 
+def load_teacher():
+    """Load a second, frozen copy of the baseline to compare against. This is
+    the reference the whole evaluation is defined relative to."""
+    model, _ = load_baseline()
+    for p in model.parameters():
+        p.requires_grad = False
+    return model
+
+
 def _model_device(model):
     """Infer the model's device rather than assuming one, so eval works no
     matter what device a compression technique leaves the model on (e.g.
@@ -115,10 +186,43 @@ def _model_device(model):
 # Eval data
 # ---------------------------------------------------------------------------
 
-def _wikitext_docs():
-    ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
-    docs = [row["text"] for row in ds if len(row["text"].strip()) > 200]
-    return docs[:WIKITEXT_EVAL_DOCS]
+def _fidelity_corpus(tokenizer):
+    """Mixed chat + prose corpus, tokenized. Returns a list of 1 x T id tensors.
+
+    Chat sequences use the model's own chat template because the baseline is
+    instruction-tuned: that is the distribution we actually care about
+    preserving. Prose sequences catch damage that only shows on long-form
+    text. Uses held-out splits so a recovery fine-tune training on the
+    corresponding train splits does not leak into the gate.
+    """
+    seqs = []
+
+    chat = load_dataset("HuggingFaceH4/no_robots", split="test", streaming=True)
+    for row in chat:
+        encoded = tokenizer.apply_chat_template(
+            row["messages"], return_tensors="pt", truncation=True,
+            max_length=FIDELITY_MAX_LEN, return_dict=True,
+        )
+        ids = encoded["input_ids"]
+        if ids.size(1) >= 32:
+            seqs.append(ids)
+        if len(seqs) >= FIDELITY_CHAT_SEQS:
+            break
+
+    n_chat = len(seqs)
+    prose = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
+    for row in prose:
+        text = row["text"].strip()
+        if len(text) < 500:
+            continue
+        ids = tokenizer(text, return_tensors="pt", truncation=True,
+                        max_length=FIDELITY_MAX_LEN).input_ids
+        if ids.size(1) >= 32:
+            seqs.append(ids)
+        if len(seqs) - n_chat >= FIDELITY_PROSE_SEQS:
+            break
+
+    return seqs
 
 
 def _lambada_examples():
@@ -126,39 +230,159 @@ def _lambada_examples():
     return [row["text"] for row in ds][:LAMBADA_EVAL_EXAMPLES]
 
 # ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — these are the ground-truth metrics)
+# Evaluation (DO NOT CHANGE - these are the ground-truth metrics)
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def compute_bpb(model, tokenizer, docs=None):
+def compute_fidelity(model, teacher, corpus):
     """
-    Bits per byte on held-out WikiText-2 test documents: vocab-independent,
-    so it stays comparable even if a technique changes tokenization or
-    architecture. Approximates target bytes with the whole document's UTF-8
-    byte length (a fixed, consistent denominator across baseline and every
-    compressed checkpoint), which is exact enough for relative comparison.
+    Teacher-forced agreement between the compressed model and the frozen
+    baseline, at two levels of strictness.
+
+    top1_agreement: fraction of positions where both models' argmax matches.
+    Directly interpretable and behaviourally meaningful - it is exactly what
+    determines greedy-decode output.
+
+    kl_div: mean forward KL(teacher || student) in nats per token. Forward
+    (mode-covering) is the correct direction for compression: we want the
+    student to reproduce everything the teacher would say, not merely find
+    one mode of it. Catches loss of confidence that top-1 agreement is blind
+    to.
+
+    Every sequence contributes hundreds of positions, so this is a far denser
+    measurement than any accuracy metric at comparable cost.
     """
     device = _model_device(model)
-    docs = docs if docs is not None else _wikitext_docs()
-    total_nats = 0.0
-    total_bytes = 0
-    for text in docs:
-        ids = tokenizer(text, return_tensors="pt", truncation=True, max_length=1024).input_ids.to(device)
-        if ids.size(1) < 2:
+    t_device = _model_device(teacher)
+
+    n_positions = 0
+    n_agree = 0
+    kl_total = 0.0
+
+    for ids in corpus:
+        s_logits = model(ids.to(device)).logits.float()
+        t_logits = teacher(ids.to(t_device)).logits.float().to(s_logits.device)
+
+        # drop the final position: it predicts a token we do not have
+        s_logits = s_logits[0, :-1, :]
+        t_logits = t_logits[0, :-1, :]
+        if s_logits.size(0) == 0:
             continue
-        out = model(ids, labels=ids)
-        num_targets = ids.size(1) - 1
-        total_nats += out.loss.item() * num_targets
-        total_bytes += len(text.encode("utf-8"))
-    return total_nats / (math.log(2) * total_bytes)
+
+        n_agree += (s_logits.argmax(-1) == t_logits.argmax(-1)).sum().item()
+
+        t_logprob = F.log_softmax(t_logits, dim=-1)
+        s_logprob = F.log_softmax(s_logits, dim=-1)
+        kl = (t_logprob.exp() * (t_logprob - s_logprob)).sum(-1)
+        kl_total += kl.sum().item()
+
+        n_positions += s_logits.size(0)
+
+    return {
+        "top1_agreement": n_agree / n_positions if n_positions else 0.0,
+        "kl_div": kl_total / n_positions if n_positions else float("inf"),
+        "fidelity_positions": n_positions,
+    }
+
+
+@torch.no_grad()
+def compute_generation_agreement(model, teacher, tokenizer, prompts=None):
+    """
+    Free-running agreement: generate greedily from both models on the same
+    prompts and measure how long they stay identical.
+
+    Teacher-forced metrics cannot see compounding error - a model can match
+    the teacher at 99% of positions when fed ground truth, then diverge into
+    garbage once it starts consuming its own output. This is the metric that
+    catches that. Score is the mean normalised prefix length before
+    divergence (1.0 = identical generations).
+    """
+    device = _model_device(model)
+    t_device = _model_device(teacher)
+    prompts = prompts if prompts is not None else SANITY_PROMPTS
+
+    scores = []
+    for prompt in prompts:
+        messages = [{"role": "user", "content": prompt}]
+        encoded = tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, return_tensors="pt", return_dict=True
+        )
+        ids = encoded["input_ids"]
+        n_prompt = ids.size(1)
+
+        try:
+            s_gen = model.generate(
+                ids.to(device), max_new_tokens=GEN_AGREEMENT_TOKENS,
+                do_sample=False, pad_token_id=tokenizer.eos_token_id,
+            )[0, n_prompt:].tolist()
+            t_gen = teacher.generate(
+                ids.to(t_device), max_new_tokens=GEN_AGREEMENT_TOKENS,
+                do_sample=False, pad_token_id=tokenizer.eos_token_id,
+            )[0, n_prompt:].tolist()
+        except RuntimeError:
+            scores.append(0.0)
+            continue
+
+        match = 0
+        for s_tok, t_tok in zip(s_gen, t_gen):
+            if s_tok != t_tok:
+                break
+            match += 1
+        scores.append(match / max(len(t_gen), 1))
+
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def _is_degenerate(text, n=_REPEAT_NGRAM_N, max_ratio=_REPEAT_NGRAM_MAX_RATIO):
+    words = text.split()
+    if len(words) < n + 1:
+        return False
+    ngrams = [tuple(words[i:i + n]) for i in range(len(words) - n + 1)]
+    unique_ratio = len(set(ngrams)) / len(ngrams)
+    return unique_ratio < (1 - max_ratio)
+
+
+@torch.no_grad()
+def run_generation_sanity(model, tokenizer, prompts=None):
+    """
+    Absolute (not comparative) check that output has not collapsed: non-empty,
+    non-degenerate, and generate() did not raise. Catches repetition loops,
+    which are the classic way a quantized model breaks.
+    """
+    device = _model_device(model)
+    prompts = prompts if prompts is not None else SANITY_PROMPTS
+    results = []
+    for prompt in prompts:
+        messages = [{"role": "user", "content": prompt}]
+        encoded = tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, return_tensors="pt", return_dict=True
+        )
+        input_ids = encoded["input_ids"].to(device)
+        try:
+            gen = model.generate(
+                input_ids,
+                max_new_tokens=GEN_MAX_NEW_TOKENS,
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        except RuntimeError as e:
+            results.append({"prompt": prompt, "ok": False, "reason": f"generate() raised: {e}"})
+            continue
+        completion = tokenizer.decode(gen[0, input_ids.size(1):], skip_special_tokens=True)
+        ok = bool(completion.strip()) and not _is_degenerate(completion)
+        results.append({"prompt": prompt, "ok": ok, "completion": completion[:200]})
+    pass_rate = sum(r["ok"] for r in results) / len(results)
+    return {"pass_rate": pass_rate, "details": results}
 
 
 @torch.no_grad()
 def compute_lambada_accuracy(model, tokenizer, examples=None):
     """
-    LAMBADA last-word cloze accuracy: split off the final word of each
-    example, greedily generate as many tokens as the target word takes, and
-    check for an exact text match (punctuation-stripped).
+    LAMBADA last-word cloze accuracy. Reported for human legibility (it is a
+    number people have intuitions about) but deliberately NOT part of the
+    quality gate: a few hundred binary outcomes cannot resolve the
+    differences we care about, and agreement-with-teacher already covers
+    capability preservation far more densely.
     """
     device = _model_device(model)
     examples = examples if examples is not None else _lambada_examples()
@@ -189,57 +413,13 @@ def compute_lambada_accuracy(model, tokenizer, examples=None):
     return correct / total if total else 0.0
 
 
-def _is_degenerate(text, n=_REPEAT_NGRAM_N, max_ratio=_REPEAT_NGRAM_MAX_RATIO):
-    words = text.split()
-    if len(words) < n + 1:
-        return False
-    ngrams = [tuple(words[i:i + n]) for i in range(len(words) - n + 1)]
-    unique_ratio = len(set(ngrams)) / len(ngrams)
-    return unique_ratio < (1 - max_ratio)
-
-
-@torch.no_grad()
-def run_generation_sanity(model, tokenizer, prompts=None):
-    """
-    Fixed instruction-prompt suite. A prompt 'passes' if the model produces a
-    non-empty, non-degenerate, NaN-free response. This catches breakage that
-    aggregate bpb/accuracy numbers can miss (e.g. coherence collapse on
-    specific heads after pruning, without moving the loss much).
-    """
-    device = _model_device(model)
-    prompts = prompts if prompts is not None else SANITY_PROMPTS
-    results = []
-    for prompt in prompts:
-        messages = [{"role": "user", "content": prompt}]
-        encoded = tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, return_tensors="pt", return_dict=True
-        )
-        input_ids = encoded["input_ids"].to(device)
-        try:
-            gen = model.generate(
-                input_ids,
-                max_new_tokens=GEN_MAX_NEW_TOKENS,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-        except RuntimeError as e:
-            results.append({"prompt": prompt, "ok": False, "reason": f"generate() raised: {e}"})
-            continue
-        completion = tokenizer.decode(gen[0, input_ids.size(1):], skip_special_tokens=True)
-        has_nan = torch.isnan(gen.float()).any().item() if torch.is_floating_point(gen) else False
-        ok = bool(completion.strip()) and not _is_degenerate(completion) and not has_nan
-        results.append({"prompt": prompt, "ok": ok, "completion": completion[:200]})
-    pass_rate = sum(r["ok"] for r in results) / len(results)
-    return {"pass_rate": pass_rate, "details": results}
-
-
 def measure_size_mb(model_dir):
     """On-disk size of a saved checkpoint directory (weights + config), in MB.
-    Deliberately size-on-disk rather than parameter count: it's the one
-    metric that's honest across quantization, structured pruning, and
+    Deliberately size-on-disk rather than parameter count: it is the one
+    metric that is honest across quantization, structured pruning, and
     distillation alike. Note that UNSTRUCTURED pruning alone does not shrink
     this number unless the result is serialized in a genuinely sparse format
-    — see program.md."""
+    - see program.md."""
     total_bytes = 0
     for root, _, files in os.walk(model_dir):
         for f in files:
@@ -249,8 +429,9 @@ def measure_size_mb(model_dir):
 
 @torch.no_grad()
 def measure_latency(model, tokenizer, prompt="The quick brown fox jumps over the lazy dog. ", max_new_tokens=100, warmup=1):
-    """Tokens/sec for greedy generation on a fixed prompt. Logged for
-    interest, not part of the quality gate or the compression objective."""
+    """Tokens/sec for greedy generation on a fixed prompt. GATED, not merely
+    logged: a technique that buys size by making inference dramatically
+    slower has not compressed anything useful."""
     device = _model_device(model)
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
     for _ in range(warmup):
@@ -266,38 +447,130 @@ def measure_latency(model, tokenizer, prompt="The quick brown fox jumps over the
     return n_generated / dt
 
 
-def evaluate_checkpoint(model, tokenizer, model_dir):
+def evaluate_checkpoint(model, tokenizer, model_dir, corpus=None):
     """
     Single entry point compress.py calls. Returns every metric needed to
     apply the quality gate and log results.tsv. DO NOT CHANGE the
     definitions of the individual metric functions above.
+
+    Ordering matters and is deliberate: everything needing the teacher runs
+    first, then the teacher is freed, and only then is throughput measured.
+    Otherwise the teacher's ~700MB sits on the GPU during the latency test
+    and depresses it, by an amount that varies with how big the compressed
+    model is - which would make a smaller model look faster purely because
+    it left more room. Since throughput is gated, that confound would
+    produce wrong verdicts.
+
+    `corpus` is rebuilt here if not supplied; pass it in to avoid
+    re-streaming the datasets.
     """
-    bpb = compute_bpb(model, tokenizer)
-    lambada_acc = compute_lambada_accuracy(model, tokenizer)
+    if corpus is None:
+        corpus = _fidelity_corpus(tokenizer)
+
+    teacher = load_teacher()
+    fidelity = compute_fidelity(model, teacher, corpus)
+    gen_agreement = compute_generation_agreement(model, teacher, tokenizer)
+
+    del teacher
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # teacher-free from here: these measure the compressed model alone
     sanity = run_generation_sanity(model, tokenizer)
+    lambada_acc = compute_lambada_accuracy(model, tokenizer)
     size_mb = measure_size_mb(model_dir)
+
+    # Throughput is measured against a reference copy loaded RIGHT NOW,
+    # rather than against the figure cached in baseline.json. On a thermally
+    # throttled laptop GPU the absolute rate drifts enormously across a
+    # session (measured: 30 tok/s cold, 12 tok/s after hours of runs, as the
+    # SM clock drops from 2100MHz to 210MHz). A ratio only cancels that
+    # common-mode drift if both halves are measured in the same thermal
+    # state, seconds apart. Both are measured with both models resident so
+    # the memory footprint is symmetric too.
+    reference = load_teacher()
+    ref_tok_per_sec = measure_latency(reference, tokenizer)
     tok_per_sec = measure_latency(model, tokenizer)
+    del reference
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return {
-        "bpb_wikitext2": bpb,
-        "lambada_acc": lambada_acc,
+        "reference_tokens_per_sec": ref_tok_per_sec,
+        "top1_agreement": fidelity["top1_agreement"],
+        "kl_div": fidelity["kl_div"],
+        "fidelity_positions": fidelity["fidelity_positions"],
+        "gen_agreement": gen_agreement,
         "gen_sanity_pass_rate": sanity["pass_rate"],
         "gen_sanity_details": sanity["details"],
+        "lambada_acc": lambada_acc,
         "size_mb": size_mb,
         "tokens_per_sec": tok_per_sec,
     }
 
 
 def passes_quality_gate(metrics, baseline):
-    """The one hard constraint. See program.md for full rationale."""
-    bpb_ok = metrics["bpb_wikitext2"] <= baseline["bpb_wikitext2"] * (1 + BPB_TOLERANCE)
-    lambada_ok = metrics["lambada_acc"] >= baseline["lambada_acc"] - LAMBADA_TOLERANCE_ABS
-    sanity_ok = metrics["gen_sanity_pass_rate"] >= baseline["gen_sanity_pass_rate"] - GEN_SANITY_TOLERANCE_ABS
-    return bpb_ok and lambada_ok and sanity_ok
+    """Breakage detector. Returns (ok, reasons) so callers can report WHY
+    something failed rather than only that it did.
+
+    Passing means "not broken", NOT "good". Ranking among passing
+    experiments is done on the frontier - see rank_key()."""
+    reasons = []
+
+    if metrics["kl_div"] > KL_CEILING:
+        reasons.append(f"kl_div {metrics['kl_div']:.4f} > {KL_CEILING}")
+    if metrics["gen_sanity_pass_rate"] < baseline["gen_sanity_pass_rate"] - GEN_SANITY_TOLERANCE_ABS:
+        reasons.append(
+            f"gen_sanity {metrics['gen_sanity_pass_rate']:.3f} < "
+            f"{baseline['gen_sanity_pass_rate'] - GEN_SANITY_TOLERANCE_ABS:.3f}"
+        )
+    ratio = speed_ratio(metrics, baseline)
+    if ratio < SPEED_FLOOR_RATIO:
+        reasons.append(f"speed_ratio {ratio:.3f} < {SPEED_FLOOR_RATIO}")
+
+    return len(reasons) == 0, reasons
 
 
 def compression_ratio(metrics, baseline):
     """The objective to maximize, once the quality gate passes."""
     return baseline["size_mb"] / metrics["size_mb"]
+
+
+def frontier_point(metrics, baseline):
+    """The three axes an experiment is ranked on, all higher-is-better.
+
+    Compression is what we are buying; fidelity and speed are what we pay
+    with. Collapsing these into one scalar would bake in an exchange rate
+    nobody has justified, so they stay separate and ranking is by Pareto
+    dominance instead.
+    """
+    return {
+        "compression_ratio": compression_ratio(metrics, baseline),
+        "top1_agreement": metrics["top1_agreement"],
+        "speed_ratio": speed_ratio(metrics, baseline),
+    }
+
+
+def dominates(a, b):
+    """True if frontier point `a` is at least as good as `b` on every axis
+    and strictly better on at least one."""
+    keys = ("compression_ratio", "top1_agreement", "speed_ratio")
+    return all(a[k] >= b[k] for k in keys) and any(a[k] > b[k] for k in keys)
+
+
+def speed_ratio(metrics, baseline=None):
+    """Throughput relative to the uncompressed model. Above 1.0 means the
+    compressed model is also faster, which is the ideal outcome.
+
+    Uses the reference measured during the same run when available, since
+    the cached baseline figure was taken in a different thermal state and is
+    not comparable (see evaluate_checkpoint). `baseline` is accepted only as
+    a fallback for metrics dicts predating that change.
+    """
+    ref = metrics.get("reference_tokens_per_sec")
+    if not ref:
+        ref = baseline["tokens_per_sec"]
+    return metrics["tokens_per_sec"] / ref
 
 # ---------------------------------------------------------------------------
 # Main
@@ -315,21 +588,18 @@ if __name__ == "__main__":
     download_baseline()
     print()
 
-    print("Data: caching WikiText-2 (test) and LAMBADA (test) via `datasets`...")
-    _wikitext_docs()
-    _lambada_examples()
-    print("Data: ready")
-    print()
-
     if os.path.exists(BASELINE_METRICS_PATH) and not args.force_baseline:
         print(f"Baseline: already computed at {BASELINE_METRICS_PATH}")
     else:
-        print("Baseline: evaluating unmodified model (this establishes the results.tsv baseline row)...")
+        print("Baseline: evaluating the unmodified model against itself.")
+        print("Agreement must come out at exactly 1.0 and KL at 0.0 by definition,")
+        print("so this doubles as a self-test that the harness is wired up correctly.")
         model, tokenizer = load_baseline()
-        metrics = evaluate_checkpoint(model, tokenizer, MODEL_CACHE_DIR)
+        corpus = _fidelity_corpus(tokenizer)
+        metrics = evaluate_checkpoint(model, tokenizer, MODEL_CACHE_DIR, corpus=corpus)
         os.makedirs(CACHE_DIR, exist_ok=True)
         with open(BASELINE_METRICS_PATH, "w") as f:
-            json.dump(metrics, f, indent=2)
+            json.dump({k: v for k, v in metrics.items() if k != "gen_sanity_details"}, f, indent=2)
         print(f"Baseline: saved to {BASELINE_METRICS_PATH}")
         print()
         print("---")

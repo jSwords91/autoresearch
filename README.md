@@ -22,30 +22,50 @@ agent iterates on.
 
 ## Why this is harder than "get a lower loss"
 
-In the original repo, training loss can improve indefinitely — lower
-`val_bpb` is always better, so the whole loop is "minimize one number
-within a fixed time budget." Compression doesn't work that way: shrink a
-model too far and it breaks, often in ways a single narrow metric won't
-catch. So this fork reframes the loop as a constrained optimization —
+In the original repo, training loss can improve indefinitely: lower
+`val_bpb` is always better, so the whole loop is "minimize one number within
+a fixed time budget." Compression doesn't work that way. Shrink a model too
+far and it breaks, often in ways a single narrow metric won't catch.
 
-- **Hard quality gate** (must pass): the compressed model must stay within
-  tolerance of the baseline on three different signals — bits-per-byte on
-  held-out WikiText-2 (fluency), LAMBADA cloze accuracy (downstream task),
-  and a generation-sanity check on a fixed instruction-prompt suite
-  (catches coherence collapse that aggregate metrics can miss). An
-  experiment that regresses on any of these is a `discard`, no matter how
-  much smaller it got.
-- **Objective to maximize** (only among experiments that pass the gate):
-  compression ratio, measured as actual bytes on disk — honest across
-  quantization, pruning, and distillation alike, unlike raw parameter count.
+The key insight this fork is built on: **compression has a privileged
+reference that ordinary model evaluation does not - the original model.**
+The question isn't "is the compressed model good", it's "is it the same as
+this specific frozen artifact". Absolute metrics like perplexity conflate
+the original's own errors with the damage you caused; agreement with the
+original isolates the damage. So nearly every metric here is comparative,
+measured at three levels of strictness:
 
-Full rationale and the exact tolerances are in `program.md`.
+- **`top1_agreement`** - does it emit the same token? This is what a user
+  actually sees under greedy decoding.
+- **`kl_div`** - does it hold the same distribution? Catches confidence loss
+  that top-1 hides. Empirically the most sensitive instrument available: a
+  2x change in quantization bit width moves it 5.5x.
+- **`gen_agreement`** - does it still say the same thing when running free?
+  The other two are teacher-forced and blind to compounding error.
+
+That reframing matters. Under an earlier absolute-metric harness, 8-bit
+quantization looked like a clean pass. Measured against the original it
+changes the emitted token **1 time in 11**.
+
+Two further design commitments:
+
+- **The gate detects breakage; the frontier measures value.** Conflating
+  those produced 17 undifferentiated `FAIL` rows in one session, with no way
+  to rank them. Now a loose gate asks only "is this broken", and surviving
+  experiments are ranked by Pareto dominance over compression, fidelity, and
+  speed.
+- **Speed is gated, not just logged.** An objective that counts only bytes
+  will happily buy size with latency: the 8-bit checkpoint above is 1.76x
+  smaller and 4.7x *slower*.
+
+Full rationale, calibration reference points, and thresholds are in
+`program.md`.
 
 ## How it works
 
 - **`prepare.py`** — fixed constants, one-time setup (downloads the
-  baseline model + eval data), and the evaluation harness (bpb, LAMBADA
-  accuracy, generation sanity, size, latency). Not modified.
+  baseline model + eval data), and the evaluation harness (agreement with
+  the frozen original, generation sanity, size, throughput). Not modified.
 - **`compress.py`** — the single file the agent edits. Contains the
   compression technique, an optional recovery-fine-tune helper, and the
   experiment runner. Everything about *how* you compress the model is fair
@@ -102,7 +122,8 @@ pyproject.toml  — dependencies
 
 - **Single file to modify.** The agent only touches `compress.py`. This keeps the scope manageable and diffs reviewable.
 - **Fixed time budget.** Every experiment runs for exactly 10 minutes, regardless of your specific platform.
-- **Three-signal quality gate, not one.** A single perplexity number is easy to game inadvertently (a technique can hold aggregate loss steady while wrecking a specific capability). Bpb + LAMBADA + generation sanity are different enough that this is hard to do by accident.
+- **Measure agreement with the original, not absolute quality.** Absolute metrics conflate the original model's own errors with compression damage. The original is a fixed reference, so comparing against it isolates exactly what you broke, and does so far more densely: ~19k token positions of full-distribution comparison per run, versus a few hundred binary accuracy outcomes.
+- **Separate "is it broken" from "is it good value".** A single tight bar answers neither well. A loose gate catches breakage; Pareto ranking over compression, fidelity and speed handles value.
 - **Size-on-disk as the compression metric.** Robust across techniques; also makes "did this actually compress anything" a literal, checkable fact rather than a claim.
 
 ## License
