@@ -101,30 +101,51 @@ def _layer_sensitivity(model, scales):
     return per_layer
 
 
-N_PROTECT = 4
+def _linear_sensitivity(model, scales):
+    """Same measured NF4 error as _layer_sensitivity, but kept per
+    projection instead of summed into its block."""
+    import bitsandbytes.functional as bnbF
+
+    out = {}
+    for name, mod in model.named_modules():
+        if not (isinstance(mod, torch.nn.Linear) and name in scales):
+            continue
+        W = mod.weight.data
+        q, state = bnbF.quantize_4bit(W.to(torch.bfloat16), quant_type="nf4")
+        W_hat = bnbF.dequantize_4bit(q, state).to(torch.float32)
+        err = (W.float() - W_hat).abs()
+        out[name] = (err * scales[name].to(err.device).unsqueeze(0)).pow(2).sum().sqrt().item()
+    return out
+
+
+N_PROTECT_LINEARS = 28
 
 
 def compress(model, tokenizer):
-    """Sensitivity-guided mixed precision: measure which transformer blocks
-    NF4 actually damages, then spend bf16 on only the worst offenders and
-    quantize everything else to 4 bits.
+    """Per-PROJECTION sensitivity-guided mixed precision.
 
-    Last session this was attempted by guessing (first/last layer, on the
-    folk belief that they are most sensitive) and it barely moved the
-    needle. Here the choice is measured: exact NF4 reconstruction error
-    weighted by real activation magnitudes, which is the error the network
-    actually experiences.
+    The previous run protected whole transformer blocks, which is coarse:
+    a block contains seven projections with very different sensitivities, so
+    protecting a block spends bf16 on its cheap projections to buy safety for
+    its expensive ones. Here the same measured error ranks all ~224 linears
+    individually and bf16 goes to the worst N regardless of which block they
+    sit in. Budget is matched to the previous run (4 blocks x 7 projections =
+    28 linears) so the comparison isolates allocation quality, not spend.
     """
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
     from prepare import MODEL_CACHE_DIR
 
     scales = _activation_scales(model, tokenizer)
-    sens = _layer_sensitivity(model, scales)
+    per_linear = _linear_sensitivity(model, scales)
 
-    ranked = sorted(sens.items(), key=lambda kv: kv[1], reverse=True)
-    protect = [idx for idx, _ in ranked[:N_PROTECT]]
-    print(f"layer sensitivity (worst first): {[(i, round(v, 1)) for i, v in ranked[:8]]}")
-    print(f"protecting layers in bf16: {sorted(protect)}")
+    ranked = sorted(per_linear.items(), key=lambda kv: kv[1], reverse=True)
+    protect = [name for name, _ in ranked[:N_PROTECT_LINEARS]]
+    print(f"worst projections: {[(n.split('layers.')[1], round(v,1)) for n,v in ranked[:8]]}")
+    from collections import Counter
+    kinds = Counter(n.split('.')[-1] for n in protect)
+    blocks = sorted({int(n.split('layers.')[1].split('.')[0]) for n in protect})
+    print(f"protected kinds: {dict(kinds)}")
+    print(f"protected spans blocks: {blocks}")
 
     del model
     if torch.cuda.is_available():
@@ -135,7 +156,7 @@ def compress(model, tokenizer):
     # derive automatically, which normally protects tied output embeddings.
     # Quantizing lm_head here breaks its tie to embed_tokens and the packed
     # 4-bit param fails to round-trip through save/reload.
-    skip = [f"model.layers.{i}" for i in protect] + ["lm_head"]
+    skip = list(protect) + ["lm_head"]
     return AutoModelForCausalLM.from_pretrained(
         MODEL_CACHE_DIR,
         quantization_config=BitsAndBytesConfig(
