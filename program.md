@@ -108,17 +108,73 @@ it on all three.
 
 ### Calibration reference points
 
-Measured on this model, so you know what the numbers mean:
+Measured on this model, so you know what the numbers mean. `fidelity` is
+the geometric mean of top1_agreement, gen_agreement and exp(-kl_div).
 
-    technique   compress  top1    kl      gen_agr  sanity  speed   verdict
-    8-bit bnb   1.757x    0.9116  0.0277  0.6867   1.000   0.213   FAIL: 4.7x too slow
-    4-bit NF4   2.643x    0.8055  0.1516  0.5339   0.917   0.882   FAIL: repetition loop
+    technique                        compress  fidel  top1    kl      speed
+    baseline (no-op)                    1.000  1.000  1.0000  0.0000  0.957
+    8-bit bnb                           1.757  --     0.9116  0.0277  0.213
+    4-bit NF4 plain                     2.643  --     0.8055  0.1516  0.753
+    AWQ scaling + 4-bit                 2.643  0.742  0.8190  0.1445  0.747
+    AWQ a=0.25 + double quant           2.789  0.772  0.8246  0.1326  0.699
+    AWQ + bf16 on worst projection      2.750  0.745  0.8357  0.1271  0.745
 
-Read those rows carefully, because they set the agenda. **4-bit is both
-smaller and 4x faster than 8-bit**; its only defect is one repetition loop.
-Fixing that defect is the most concrete open target in this project. 8-bit's
-problem is structural: `LLM.int8()` dequantizes on every matmul, so it is
-slow by construction at batch size 1 and no amount of tuning will fix it.
+8-bit fails the gate (0.213 speed: LLM.int8() dequantizes every matmul, so
+it is slow by construction at batch size 1). Plain 4-bit fails on a
+repetition loop. The best known configuration is **activation-aware scaling
+with a uniform alpha of 0.25, plus double quantization**: 2.789x at
+fidelity 0.772.
+
+### What has been established, and what it cost to learn
+
+**Activation-aware scaling is free fidelity.** Scale weight column j by s_j
+and fold 1/s_j into the preceding RMSNorm: the function computed is exactly
+identical, but NF4 spends its resolution on channels carrying signal. Zero
+bytes, and it eliminates the repetition loop that bf16 protection needed
+54MB to fix. This is the single highest-value technique found.
+
+**Sensitivity to quantization rises monotonically with depth**, and
+`down_proj`/`o_proj` dominate it - the two projections that *write into*
+the residual stream. Reading from it (q/k/v/gate/up) is cheap; writing to a
+narrow residual stream is expensive.
+
+**Deletion tolerance is a completely different ranking from quantization
+sensitivity.** Measured cost of deleting each block: middle blocks (15-20)
+are ~0.07-0.10 KL, but block 3 is 9.85 and block 0 is 7.93 - two orders of
+magnitude more. An earlier session deleted *tail* blocks, saw collapse, and
+concluded layer removal does not work here. Tail blocks are ~8x costlier
+than middle ones; that conclusion was drawn from near the worst available
+choice. Always measure before removing.
+
+**Three separate attempts to optimise a proxy all made the model worse:**
+
+- Per-group alpha searched against activation-weighted weight
+  reconstruction error picked ~0.4 nearly everywhere; the true optimum is
+  0.25, and fidelity fell 0.772 -> 0.710.
+- Per-block alpha searched against *measured KL with the quantizer in the
+  loop* achieved the best KL of any variant (0.129) and still lost overall,
+  0.772 -> 0.668, because driving teacher-forced KL down cost free-running
+  agreement.
+- Scaling `down_proj` improves top1 and KL every time and costs
+  gen_agreement every time.
+
+The pattern is consistent and worth internalising: **teacher-forced fidelity
+and free-running behaviour are genuinely different objectives**, and greedy
+per-block optimisation overfits whichever one you point it at. A uniform
+prior has beaten every per-block search attempted so far.
+
+**Local repair does work, unlike the whole-model attempts.** Deleting block
+20 then distilling only its neighbours (19.7M trainable, packed batches,
+453k tokens, KL objective) improved every axis. It was still not enough to
+clear the gate, and deleting 1 of 32 blocks buys only +0.055x compression,
+so the technique is sound but the target was not worth it. Point it at
+larger damage.
+
+**Structural surgery must be expressible in config.json**, because the
+harness reloads checkpoints from disk. Uniform changes survive
+(`num_hidden_layers`, `intermediate_size`, head counts); per-layer shape
+changes do not. Deleting layers also requires reindexing `layer_idx` on the
+survivors or the KV cache indexes off the end.
 
 **Important caveat**: unstructured pruning (zeroing individual weights) does
 **not** reduce `size_mb` unless you serialize in a genuinely sparse format -
