@@ -203,6 +203,13 @@ def compress(model, tokenizer):
     print(f"deleting layers: {drop}")
 
     kept = [l for i, l in enumerate(model.model.layers) if i not in drop]
+    # Survivors carry stale layer_idx values, which the KV cache uses to index
+    # its per-layer storage - leaving them alone indexes off the end of a cache
+    # that is now shorter than the original stack.
+    for new_idx, layer in enumerate(kept):
+        layer.self_attn.layer_idx = new_idx
+        if hasattr(layer, "layer_idx"):
+            layer.layer_idx = new_idx
     model.model.layers = torch.nn.ModuleList(kept)
     model.config.num_hidden_layers = len(kept)
     if getattr(model.config, "layer_types", None) is not None:
