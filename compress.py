@@ -49,8 +49,9 @@ t_start = time.time()
 # so it is the one plain AWQ implementations usually skip.
 
 ALPHA = 0.25
-SCALE_DOWN_PROJ = False
+SCALE_DOWN_PROJ = True
 DOUBLE_QUANT = True
+PROTECT_WORST = ["model.layers.31.mlp.down_proj"]
 
 
 def _norm_input_acts(model, tokenizer, n_seqs=8):
@@ -155,6 +156,7 @@ def compress(model, tokenizer):
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=DOUBLE_QUANT,
+            llm_int8_skip_modules=PROTECT_WORST + ["lm_head"],
         ),
         device_map="auto",
     )
