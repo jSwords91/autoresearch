@@ -99,83 +99,67 @@ def _scale_from(act, alpha):
     return s.clamp(min=1e-3, max=1e3)
 
 
-def _apply_awq_scaling(model, acts, alpha=ALPHA, scale_down=SCALE_DOWN_PROJ):
-    n_scaled = 0
+ALPHA_GRID = (0.0, 0.1, 0.2, 0.25, 0.3, 0.4, 0.5, 0.7)
+
+
+def _best_alpha(weights, act, grid=ALPHA_GRID):
+    """Pick the scaling exponent that actually minimises quantization error
+    for this specific group of projections.
+
+    A single global alpha is a guess that one exponent suits all 32 blocks.
+    It does not: the alpha sweep showed 0.25 beating both 0.5 and 0.125
+    overall, which only means 0.25 is the best *compromise*. Here each group
+    is scored against the real NF4 quantizer over a small grid and keeps its
+    own optimum, with error weighted by the measured activation scale so it
+    reflects error the network actually experiences. alpha=0.0 is in the
+    grid so a group is free to decline scaling altogether.
+    """
+    import bitsandbytes.functional as bnbF
+
+    a = act.float().clamp(min=1e-5)
+    best, best_err = 0.0, None
+    for alpha in grid:
+        s = _scale_from(a, alpha).to(weights[0].device)
+        err = 0.0
+        for W in weights:
+            Ws = W.to(torch.bfloat16) * s.to(torch.bfloat16).unsqueeze(0)
+            q, st = bnbF.quantize_4bit(Ws, quant_type="nf4")
+            W_hat = bnbF.dequantize_4bit(q, st).float() / s.unsqueeze(0)
+            err += ((W.float() - W_hat) * a.unsqueeze(0)).pow(2).sum().item()
+        if best_err is None or err < best_err:
+            best, best_err = alpha, err
+    return best
+
+
+def _apply_awq_scaling(model, acts, alpha=None, scale_down=SCALE_DOWN_PROJ):
+    """Fold a per-group scale into the preceding op and out of the weights.
+    With alpha=None each group grid-searches its own exponent."""
+    chosen = []
     for i, layer in enumerate(model.model.layers):
-        # q/k/v <- input_layernorm
-        s = _scale_from(acts[f"{i}.attn_in"], alpha).to(layer.input_layernorm.weight.device)
-        layer.input_layernorm.weight.data /= s.to(layer.input_layernorm.weight.dtype)
-        for proj in (layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj):
-            proj.weight.data *= s.to(proj.weight.dtype).unsqueeze(0)
-        n_scaled += 3
-
-        # gate/up <- post_attention_layernorm
-        s = _scale_from(acts[f"{i}.mlp_in"], alpha).to(layer.post_attention_layernorm.weight.device)
-        layer.post_attention_layernorm.weight.data /= s.to(layer.post_attention_layernorm.weight.dtype)
-        for proj in (layer.mlp.gate_proj, layer.mlp.up_proj):
-            proj.weight.data *= s.to(proj.weight.dtype).unsqueeze(0)
-        n_scaled += 2
-
-        # down <- up_proj rows
+        groups = [
+            (f"{i}.attn_in", layer.input_layernorm,
+             [layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj], None),
+            (f"{i}.mlp_in", layer.post_attention_layernorm,
+             [layer.mlp.gate_proj, layer.mlp.up_proj], None),
+        ]
         if scale_down:
-            s = _scale_from(acts[f"{i}.down_in"], alpha).to(layer.mlp.up_proj.weight.device)
-            layer.mlp.up_proj.weight.data /= s.to(layer.mlp.up_proj.weight.dtype).unsqueeze(1)
-            layer.mlp.down_proj.weight.data *= s.to(layer.mlp.down_proj.weight.dtype).unsqueeze(0)
-            n_scaled += 1
-    return n_scaled
+            groups.append((f"{i}.down_in", None, [layer.mlp.down_proj], layer.mlp.up_proj))
 
+        for key, norm, projs, row_src in groups:
+            act = acts[key]
+            a = alpha if alpha is not None else _best_alpha([p.weight.data for p in projs], act)
+            chosen.append(a)
+            s = _scale_from(act, a).to(projs[0].weight.device)
+            if norm is not None:
+                norm.weight.data /= s.to(norm.weight.dtype)
+            else:
+                row_src.weight.data /= s.to(row_src.weight.dtype).unsqueeze(1)
+            for proj in projs:
+                proj.weight.data *= s.to(proj.weight.dtype).unsqueeze(0)
 
-# --- Measured layer-deletion tolerance -------------------------------------
-# Which layers can actually be deleted? A previous session dropped tail
-# layers, watched the model collapse, and concluded layer removal does not
-# work on this architecture. That conclusion was never tested against the
-# alternative: the tail may simply be the worst possible choice. With a
-# frozen teacher and a KL metric we can just measure it - delete each layer
-# in turn, score the damage, and let the ranking decide.
-#
-# This is cheap because it needs no retraining and no rebuilds: removing a
-# module from a ModuleList and putting it back is free, and KL on a handful
-# of calibration sequences is a fraction of a second.
-
-N_DROP = 1
-
-
-def _deletion_tolerance(model, teacher, tokenizer, n_seqs=4):
-    """Mean KL(teacher || model-without-layer-i) for every layer i."""
-    import torch.nn.functional as F
-    from datasets import load_dataset
-
-    device = next(model.parameters()).device
-    ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1",
-                      split="train", streaming=True)
-    calib, n = [], 0
-    for row in ds:
-        if len(row["text"].strip()) < 500:
-            continue
-        calib.append(tokenizer(row["text"].strip(), return_tensors="pt",
-                               truncation=True, max_length=384).input_ids.to(device))
-        n += 1
-        if n >= n_seqs:
-            break
-
-    with torch.no_grad():
-        t_logprobs = [F.log_softmax(teacher(ids).logits.float(), dim=-1) for ids in calib]
-
-    original = list(model.model.layers)
-    cost = {}
-    for i in range(len(original)):
-        kept = original[:i] + original[i + 1:]
-        model.model.layers = torch.nn.ModuleList(kept)
-        total, count = 0.0, 0
-        with torch.no_grad():
-            for ids, tlp in zip(calib, t_logprobs):
-                slp = F.log_softmax(model(ids).logits.float(), dim=-1)
-                kl = (tlp.exp() * (tlp - slp)).sum(-1)
-                total += kl.sum().item()
-                count += kl.numel()
-        cost[i] = total / count
-    model.model.layers = torch.nn.ModuleList(original)
-    return cost
+    from collections import Counter
+    print(f"per-group alpha chosen: {dict(sorted(Counter(chosen).items()))}")
+    return len(chosen)
 
 
 REPAIR_SECONDS = 240
@@ -260,51 +244,15 @@ def _repair_locally(model, teacher, tokenizer, neighbours):
 
 
 def compress(model, tokenizer):
-    """Delete the layers that measurement says are cheapest to delete, then
-    apply activation-aware scaling and 4-bit quantization to what is left.
-
-    Unlike quantization, removing a layer makes the model both smaller AND
-    faster, so if any layers are genuinely redundant this should beat
-    quantization alone on two axes at once.
-    """
+    """Activation-aware scaling with a per-group searched exponent, then
+    4-bit NF4 with double quantization."""
     import shutil as _sh
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
-    from prepare import MODEL_CACHE_DIR, CACHE_DIR, load_teacher
-
-    teacher = load_teacher()
-    cost = _deletion_tolerance(model, teacher, tokenizer)
-    del teacher
-    torch.cuda.empty_cache()
-
-    ranked = sorted(cost.items(), key=lambda kv: kv[1])
-    print(f"cheapest layers to delete: {[(i, round(c, 4)) for i, c in ranked[:6]]}")
-    print(f"most expensive:            {[(i, round(c, 4)) for i, c in ranked[-4:]]}")
-
-    drop = sorted(i for i, _ in ranked[:N_DROP])
-    print(f"deleting layers: {drop}")
-
-    kept = [l for i, l in enumerate(model.model.layers) if i not in drop]
-    # Survivors carry stale layer_idx values, which the KV cache uses to index
-    # its per-layer storage - leaving them alone indexes off the end of a cache
-    # that is now shorter than the original stack.
-    for new_idx, layer in enumerate(kept):
-        layer.self_attn.layer_idx = new_idx
-        if hasattr(layer, "layer_idx"):
-            layer.layer_idx = new_idx
-    model.model.layers = torch.nn.ModuleList(kept)
-    model.config.num_hidden_layers = len(kept)
-    if getattr(model.config, "layer_types", None) is not None:
-        model.config.layer_types = model.config.layer_types[:len(kept)]
-
-    neighbours = sorted({max(0, drop[0] - 1), min(len(kept) - 1, drop[0])})
-    print(f"repairing neighbours: {neighbours}")
-    teacher = load_teacher()
-    _repair_locally(model, teacher, tokenizer, neighbours)
-    del teacher
-    torch.cuda.empty_cache()
+    from prepare import CACHE_DIR
 
     acts = _norm_input_acts(model, tokenizer)
-    _apply_awq_scaling(model, acts)
+    n = _apply_awq_scaling(model, acts, alpha=None)
+    print(f"awq: rescaled {n} groups with searched alphas, down_proj={SCALE_DOWN_PROJ}")
 
     tmp = os.path.join(CACHE_DIR, "_awq_tmp")
     _sh.rmtree(tmp, ignore_errors=True)
