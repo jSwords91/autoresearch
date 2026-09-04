@@ -99,36 +99,105 @@ def _scale_from(act, alpha):
     return s.clamp(min=1e-3, max=1e3)
 
 
-ALPHA_GRID = (0.0, 0.1, 0.2, 0.25, 0.3, 0.4, 0.5, 0.7)
+ALPHA_GRID = (0.0, 0.15, 0.25, 0.35, 0.5)
 
 
-def _best_alpha(weights, act, grid=ALPHA_GRID):
-    """Pick the scaling exponent that actually minimises quantization error
-    for this specific group of projections.
-
-    A single global alpha is a guess that one exponent suits all 32 blocks.
-    It does not: the alpha sweep showed 0.25 beating both 0.5 and 0.125
-    overall, which only means 0.25 is the best *compromise*. Here each group
-    is scored against the real NF4 quantizer over a small grid and keeps its
-    own optimum, with error weighted by the measured activation scale so it
-    reflects error the network actually experiences. alpha=0.0 is in the
-    grid so a group is free to decline scaling altogether.
-    """
+def _fake_quant_(module):
+    """Quantize then dequantize a Linear's weights in place, so the model
+    carries real NF4 error while staying a normal bf16 module we can keep
+    running forward passes through."""
     import bitsandbytes.functional as bnbF
+    W = module.weight.data
+    q, st = bnbF.quantize_4bit(W.to(torch.bfloat16), quant_type="nf4")
+    module.weight.data = bnbF.dequantize_4bit(q, st).to(W.dtype)
 
-    a = act.float().clamp(min=1e-5)
-    best, best_err = 0.0, None
-    for alpha in grid:
-        s = _scale_from(a, alpha).to(weights[0].device)
-        err = 0.0
-        for W in weights:
-            Ws = W.to(torch.bfloat16) * s.to(torch.bfloat16).unsqueeze(0)
-            q, st = bnbF.quantize_4bit(Ws, quant_type="nf4")
-            W_hat = bnbF.dequantize_4bit(q, st).float() / s.unsqueeze(0)
-            err += ((W.float() - W_hat) * a.unsqueeze(0)).pow(2).sum().item()
-        if best_err is None or err < best_err:
-            best, best_err = alpha, err
-    return best
+
+def _search_alphas_against_kl(model, teacher, tokenizer, acts, n_seqs=2):
+    """Choose each block's alpha by measuring the KL it actually causes,
+    with the quantizer in the loop.
+
+    The previous experiment searched alpha against activation-weighted
+    weight-reconstruction error and made the model worse: it picked ~0.4
+    everywhere while 0.25 was truly better. The surrogate is not the
+    objective. So this optimises the objective directly - fake-quantize,
+    run a real forward pass, measure real KL against the teacher, and let
+    each block keep the exponent that actually minimises damage.
+
+    Greedy coordinate descent: blocks are swept in order, each keeping its
+    best exponent before the next is considered. Only the block under test
+    is re-quantized per trial, which is what keeps a 32-block x 5-alpha
+    sweep inside one experiment's budget.
+    """
+    import torch.nn.functional as F
+    from datasets import load_dataset
+    import copy
+
+    device = next(model.parameters()).device
+    ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1",
+                      split="train", streaming=True)
+    calib, n = [], 0
+    for row in ds:
+        if len(row["text"].strip()) < 500:
+            continue
+        calib.append(tokenizer(row["text"].strip(), return_tensors="pt",
+                               truncation=True, max_length=384).input_ids.to(device))
+        n += 1
+        if n >= n_seqs:
+            break
+    with torch.no_grad():
+        t_lp = [F.log_softmax(teacher(ids).logits.float(), dim=-1) for ids in calib]
+
+    def kl_now():
+        total, count = 0.0, 0
+        with torch.no_grad():
+            for ids, tlp in zip(calib, t_lp):
+                slp = F.log_softmax(model(ids).logits.float(), dim=-1)
+                k = (tlp.exp() * (tlp - slp)).sum(-1)
+                total += k.sum().item()
+                count += k.numel()
+        return total / count
+
+    pristine = {i: copy.deepcopy(l).cpu() for i, l in enumerate(model.model.layers)}
+
+    def rebuild(i, alpha):
+        """Reset block i from pristine weights, scale by alpha, fake-quantize."""
+        src = pristine[i]
+        layer = model.model.layers[i]
+        layer.load_state_dict({k: v.to(device) for k, v in src.state_dict().items()})
+        for key, norm, projs in (
+            (f"{i}.attn_in", layer.input_layernorm,
+             [layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj]),
+            (f"{i}.mlp_in", layer.post_attention_layernorm,
+             [layer.mlp.gate_proj, layer.mlp.up_proj]),
+        ):
+            sc = _scale_from(acts[key], alpha).to(device)
+            norm.weight.data /= sc.to(norm.weight.dtype)
+            for proj in projs:
+                proj.weight.data *= sc.to(proj.weight.dtype).unsqueeze(0)
+        for m in (layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj,
+                  layer.self_attn.o_proj, layer.mlp.gate_proj, layer.mlp.up_proj,
+                  layer.mlp.down_proj):
+            _fake_quant_(m)
+
+    # start from a uniformly quantized model at the known-good global alpha
+    for i in range(len(model.model.layers)):
+        rebuild(i, 0.25)
+
+    chosen = {}
+    for i in range(len(model.model.layers)):
+        best_a, best_kl = None, None
+        for alpha in ALPHA_GRID:
+            rebuild(i, alpha)
+            k = kl_now()
+            if best_kl is None or k < best_kl:
+                best_a, best_kl = alpha, k
+        rebuild(i, best_a)
+        chosen[i] = best_a
+    print(f"searched alphas: {chosen}")
+    from collections import Counter
+    print(f"alpha histogram: {dict(sorted(Counter(chosen.values()).items()))}")
+    print(f"final calibration KL: {kl_now():.4f}")
+    return chosen, pristine
 
 
 def _apply_awq_scaling(model, acts, alpha=None, scale_down=SCALE_DOWN_PROJ):
@@ -244,15 +313,33 @@ def _repair_locally(model, teacher, tokenizer, neighbours):
 
 
 def compress(model, tokenizer):
-    """Activation-aware scaling with a per-group searched exponent, then
-    4-bit NF4 with double quantization."""
+    """Per-block alpha chosen by measured KL, then real 4-bit NF4."""
     import shutil as _sh
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
-    from prepare import CACHE_DIR
+    from prepare import CACHE_DIR, load_teacher
 
     acts = _norm_input_acts(model, tokenizer)
-    n = _apply_awq_scaling(model, acts, alpha=None)
-    print(f"awq: rescaled {n} groups with searched alphas, down_proj={SCALE_DOWN_PROJ}")
+
+    teacher = load_teacher()
+    chosen, pristine = _search_alphas_against_kl(model, teacher, tokenizer, acts)
+    del teacher
+    torch.cuda.empty_cache()
+
+    # Rebuild from pristine weights with the chosen alphas, WITHOUT fake
+    # quantization - bnb does the real thing at load time.
+    device = next(model.parameters()).device
+    for i, layer in enumerate(model.model.layers):
+        layer.load_state_dict({k: v.to(device) for k, v in pristine[i].state_dict().items()})
+        for key, norm, projs in (
+            (f"{i}.attn_in", layer.input_layernorm,
+             [layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj]),
+            (f"{i}.mlp_in", layer.post_attention_layernorm,
+             [layer.mlp.gate_proj, layer.mlp.up_proj]),
+        ):
+            sc = _scale_from(acts[key], chosen[i]).to(device)
+            norm.weight.data /= sc.to(norm.weight.dtype)
+            for proj in projs:
+                proj.weight.data *= sc.to(proj.weight.dtype).unsqueeze(0)
 
     tmp = os.path.join(CACHE_DIR, "_awq_tmp")
     _sh.rmtree(tmp, ignore_errors=True)
