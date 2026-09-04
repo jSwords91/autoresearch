@@ -48,7 +48,7 @@ t_start = time.time()
 # sensitivity ranking, and unlike the others it has no norm in front of it,
 # so it is the one plain AWQ implementations usually skip.
 
-ALPHA = 0.5
+ALPHA = 0.75
 SCALE_DOWN_PROJ = True
 DOUBLE_QUANT = True
 
