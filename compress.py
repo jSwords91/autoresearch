@@ -28,145 +28,136 @@ t_start = time.time()
 # surgery, or any combination. See program.md for the rules of the loop.
 # ---------------------------------------------------------------------------
 
-def _activation_scales(model, tokenizer, n_seqs=8):
-    """Mean |activation| per input channel for every Linear in the blocks.
+# --- Activation-aware scaling (AWQ-style) ----------------------------------
+# Rather than spending bf16 to protect sensitive weights, make 4 bits go
+# further. NF4 quantizes in blocks with a shared absmax scale, so within a
+# block the channels with the largest magnitude get the most of the grid.
+# If we scale weight column j up by s_j and fold 1/s_j into whatever produced
+# that input channel, the network computes exactly the same function, but the
+# quantizer now spends its resolution on the channels that actually carry
+# signal.
+#
+# Two foldings are exact here:
+#   q/k/v   <- input_layernorm.weight          (RMSNorm is elementwise)
+#   gate/up <- post_attention_layernorm.weight
+#   down    <- up_proj output rows   (down's input is act(gate(x)) * up(x),
+#                                     so scaling up's row j by 1/s scales
+#                                     that product channel by 1/s)
+#
+# down_proj is the point of this: it was the single worst projection in the
+# sensitivity ranking, and unlike the others it has no norm in front of it,
+# so it is the one plain AWQ implementations usually skip.
 
-    Quantization error only matters in proportion to what multiplies it. A
-    weight column that never sees large activations can be reconstructed
-    badly at no cost; one that does is expensive. This is the AWQ insight,
-    used here purely as a measurement rather than to rescale anything.
-    """
-    from datasets import load_dataset
+ALPHA = 0.5
+SCALE_DOWN_PROJ = False
 
-    scales, hooks = {}, []
 
-    def mk_hook(name):
+def _norm_input_acts(model, tokenizer, n_seqs=8):
+    """Mean |activation| per channel at each point we can fold a scale into."""
+    acts, hooks = {}, []
+
+    def mk(name):
         def hook(mod, args):
             x = args[0].detach()
-            s = x.abs().float().reshape(-1, x.shape[-1]).mean(0)
-            scales[name] = scales[name] + s if name in scales else s
+            v = x.abs().float().reshape(-1, x.shape[-1]).mean(0)
+            acts[name] = acts[name] + v if name in acts else v
         return hook
 
-    for name, mod in model.named_modules():
-        if isinstance(mod, torch.nn.Linear) and "layers." in name:
-            hooks.append(mod.register_forward_pre_hook(mk_hook(name)))
+    for i, layer in enumerate(model.model.layers):
+        hooks.append(layer.self_attn.q_proj.register_forward_pre_hook(mk(f"{i}.attn_in")))
+        hooks.append(layer.mlp.gate_proj.register_forward_pre_hook(mk(f"{i}.mlp_in")))
+        hooks.append(layer.mlp.down_proj.register_forward_pre_hook(mk(f"{i}.down_in")))
 
+    from datasets import load_dataset
     ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1",
                       split="train", streaming=True)
     device = next(model.parameters()).device
     n = 0
     with torch.no_grad():
         for row in ds:
-            text = row["text"].strip()
-            if len(text) < 500:
+            if len(row["text"].strip()) < 500:
                 continue
-            ids = tokenizer(text, return_tensors="pt", truncation=True,
-                            max_length=512).input_ids.to(device)
+            ids = tokenizer(row["text"].strip(), return_tensors="pt",
+                            truncation=True, max_length=512).input_ids.to(device)
             model(ids)
             n += 1
             if n >= n_seqs:
                 break
-
     for h in hooks:
         h.remove()
-    return scales
+    return acts
 
 
-def _layer_sensitivity(model, scales):
-    """Rank transformer blocks by how much NF4 actually hurts them.
-
-    Uses bitsandbytes' own quantize/dequantize to get the exact NF4
-    reconstruction error rather than a proxy, weighted by the measured
-    activation scale, so this is the real error the network would see. Costs
-    one calibration pass plus some elementwise math - no model rebuilds,
-    which is what makes a 32-layer sweep affordable inside one experiment.
-    """
-    import bitsandbytes.functional as bnbF
-    import re
-    from collections import defaultdict
-
-    per_layer = defaultdict(float)
-    for name, mod in model.named_modules():
-        if not (isinstance(mod, torch.nn.Linear) and name in scales):
-            continue
-        W = mod.weight.data
-        q, state = bnbF.quantize_4bit(W.to(torch.bfloat16), quant_type="nf4")
-        W_hat = bnbF.dequantize_4bit(q, state).to(torch.float32)
-        err = (W.float() - W_hat).abs()
-        # err is (out, in); scale is per input channel
-        weighted = (err * scales[name].to(err.device).unsqueeze(0)).pow(2).sum().sqrt()
-        idx = int(re.search(r"layers\.(\d+)\.", name).group(1))
-        per_layer[idx] += weighted.item()
-
-    return per_layer
+def _scale_from(act, alpha):
+    """s = act^alpha, normalised to geometric mean 1 so the folding neither
+    inflates nor deflates the tensors overall."""
+    a = act.float().clamp(min=1e-5)
+    s = a.pow(alpha)
+    s = s / s.log().mean().exp()
+    return s.clamp(min=1e-3, max=1e3)
 
 
-def _linear_sensitivity(model, scales):
-    """Same measured NF4 error as _layer_sensitivity, but kept per
-    projection instead of summed into its block."""
-    import bitsandbytes.functional as bnbF
+def _apply_awq_scaling(model, acts, alpha=ALPHA, scale_down=SCALE_DOWN_PROJ):
+    n_scaled = 0
+    for i, layer in enumerate(model.model.layers):
+        # q/k/v <- input_layernorm
+        s = _scale_from(acts[f"{i}.attn_in"], alpha).to(layer.input_layernorm.weight.device)
+        layer.input_layernorm.weight.data /= s.to(layer.input_layernorm.weight.dtype)
+        for proj in (layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj):
+            proj.weight.data *= s.to(proj.weight.dtype).unsqueeze(0)
+        n_scaled += 3
 
-    out = {}
-    for name, mod in model.named_modules():
-        if not (isinstance(mod, torch.nn.Linear) and name in scales):
-            continue
-        W = mod.weight.data
-        q, state = bnbF.quantize_4bit(W.to(torch.bfloat16), quant_type="nf4")
-        W_hat = bnbF.dequantize_4bit(q, state).to(torch.float32)
-        err = (W.float() - W_hat).abs()
-        out[name] = (err * scales[name].to(err.device).unsqueeze(0)).pow(2).sum().sqrt().item()
-    return out
+        # gate/up <- post_attention_layernorm
+        s = _scale_from(acts[f"{i}.mlp_in"], alpha).to(layer.post_attention_layernorm.weight.device)
+        layer.post_attention_layernorm.weight.data /= s.to(layer.post_attention_layernorm.weight.dtype)
+        for proj in (layer.mlp.gate_proj, layer.mlp.up_proj):
+            proj.weight.data *= s.to(proj.weight.dtype).unsqueeze(0)
+        n_scaled += 2
 
-
-N_PROTECT_LINEARS = 28
+        # down <- up_proj rows
+        if scale_down:
+            s = _scale_from(acts[f"{i}.down_in"], alpha).to(layer.mlp.up_proj.weight.device)
+            layer.mlp.up_proj.weight.data /= s.to(layer.mlp.up_proj.weight.dtype).unsqueeze(1)
+            layer.mlp.down_proj.weight.data *= s.to(layer.mlp.down_proj.weight.dtype).unsqueeze(0)
+            n_scaled += 1
+    return n_scaled
 
 
 def compress(model, tokenizer):
-    """Per-PROJECTION sensitivity-guided mixed precision.
+    """Activation-aware scaling, then plain 4-bit NF4 everywhere.
 
-    The previous run protected whole transformer blocks, which is coarse:
-    a block contains seven projections with very different sensitivities, so
-    protecting a block spends bf16 on its cheap projections to buy safety for
-    its expensive ones. Here the same measured error ranks all ~224 linears
-    individually and bf16 goes to the worst N regardless of which block they
-    sit in. Budget is matched to the previous run (4 blocks x 7 projections =
-    28 linears) so the comparison isolates allocation quality, not spend.
+    No bf16 protection at all - this keeps the full 2.64x of plain 4-bit and
+    tries to buy the fidelity back for free by rearranging what the quantizer
+    spends its resolution on.
     """
+    import shutil as _sh
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
-    from prepare import MODEL_CACHE_DIR
+    from prepare import MODEL_CACHE_DIR, CACHE_DIR
 
-    scales = _activation_scales(model, tokenizer)
-    per_linear = _linear_sensitivity(model, scales)
+    acts = _norm_input_acts(model, tokenizer)
+    n = _apply_awq_scaling(model, acts)
+    print(f"awq: rescaled {n} projections, alpha={ALPHA}, down_proj={SCALE_DOWN_PROJ}")
 
-    ranked = sorted(per_linear.items(), key=lambda kv: kv[1], reverse=True)
-    protect = [name for name, _ in ranked[:N_PROTECT_LINEARS]]
-    print(f"worst projections: {[(n.split('layers.')[1], round(v,1)) for n,v in ranked[:8]]}")
-    from collections import Counter
-    kinds = Counter(n.split('.')[-1] for n in protect)
-    blocks = sorted({int(n.split('layers.')[1].split('.')[0]) for n in protect})
-    print(f"protected kinds: {dict(kinds)}")
-    print(f"protected spans blocks: {blocks}")
+    tmp = os.path.join(CACHE_DIR, "_awq_tmp")
+    _sh.rmtree(tmp, ignore_errors=True)
+    model.save_pretrained(tmp, safe_serialization=True)
+    tokenizer.save_pretrained(tmp)
 
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # lm_head must stay out of the skip list's blast radius: passing
-    # llm_int8_skip_modules REPLACES the list transformers would otherwise
-    # derive automatically, which normally protects tied output embeddings.
-    # Quantizing lm_head here breaks its tie to embed_tokens and the packed
-    # 4-bit param fails to round-trip through save/reload.
-    skip = list(protect) + ["lm_head"]
-    return AutoModelForCausalLM.from_pretrained(
-        MODEL_CACHE_DIR,
+    q = AutoModelForCausalLM.from_pretrained(
+        tmp,
         quantization_config=BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
-            llm_int8_skip_modules=skip,
         ),
         device_map="auto",
     )
+    _sh.rmtree(tmp, ignore_errors=True)
+    return q
 
 
 # ---------------------------------------------------------------------------
