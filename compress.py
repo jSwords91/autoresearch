@@ -28,23 +28,116 @@ t_start = time.time()
 # surgery, or any combination. See program.md for the rules of the loop.
 # ---------------------------------------------------------------------------
 
+def _activation_scales(model, tokenizer, n_seqs=8):
+    """Mean |activation| per input channel for every Linear in the blocks.
+
+    Quantization error only matters in proportion to what multiplies it. A
+    weight column that never sees large activations can be reconstructed
+    badly at no cost; one that does is expensive. This is the AWQ insight,
+    used here purely as a measurement rather than to rescale anything.
+    """
+    from datasets import load_dataset
+
+    scales, hooks = {}, []
+
+    def mk_hook(name):
+        def hook(mod, args):
+            x = args[0].detach()
+            s = x.abs().float().reshape(-1, x.shape[-1]).mean(0)
+            scales[name] = scales[name] + s if name in scales else s
+        return hook
+
+    for name, mod in model.named_modules():
+        if isinstance(mod, torch.nn.Linear) and "layers." in name:
+            hooks.append(mod.register_forward_pre_hook(mk_hook(name)))
+
+    ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1",
+                      split="train", streaming=True)
+    device = next(model.parameters()).device
+    n = 0
+    with torch.no_grad():
+        for row in ds:
+            text = row["text"].strip()
+            if len(text) < 500:
+                continue
+            ids = tokenizer(text, return_tensors="pt", truncation=True,
+                            max_length=512).input_ids.to(device)
+            model(ids)
+            n += 1
+            if n >= n_seqs:
+                break
+
+    for h in hooks:
+        h.remove()
+    return scales
+
+
+def _layer_sensitivity(model, scales):
+    """Rank transformer blocks by how much NF4 actually hurts them.
+
+    Uses bitsandbytes' own quantize/dequantize to get the exact NF4
+    reconstruction error rather than a proxy, weighted by the measured
+    activation scale, so this is the real error the network would see. Costs
+    one calibration pass plus some elementwise math - no model rebuilds,
+    which is what makes a 32-layer sweep affordable inside one experiment.
+    """
+    import bitsandbytes.functional as bnbF
+    import re
+    from collections import defaultdict
+
+    per_layer = defaultdict(float)
+    for name, mod in model.named_modules():
+        if not (isinstance(mod, torch.nn.Linear) and name in scales):
+            continue
+        W = mod.weight.data
+        q, state = bnbF.quantize_4bit(W.to(torch.bfloat16), quant_type="nf4")
+        W_hat = bnbF.dequantize_4bit(q, state).to(torch.float32)
+        err = (W.float() - W_hat).abs()
+        # err is (out, in); scale is per input channel
+        weighted = (err * scales[name].to(err.device).unsqueeze(0)).pow(2).sum().sqrt()
+        idx = int(re.search(r"layers\.(\d+)\.", name).group(1))
+        per_layer[idx] += weighted.item()
+
+    return per_layer
+
+
+N_PROTECT = 4
+
+
 def compress(model, tokenizer):
-    """4-bit NF4 weight quantization via bitsandbytes. Reference point for
-    the branch: 2.6x smaller and ~4x faster than 8-bit, whose only defect
-    under the new eval was a single repetition loop."""
+    """Sensitivity-guided mixed precision: measure which transformer blocks
+    NF4 actually damages, then spend bf16 on only the worst offenders and
+    quantize everything else to 4 bits.
+
+    Last session this was attempted by guessing (first/last layer, on the
+    folk belief that they are most sensitive) and it barely moved the
+    needle. Here the choice is measured: exact NF4 reconstruction error
+    weighted by real activation magnitudes, which is the error the network
+    actually experiences.
+    """
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
     from prepare import MODEL_CACHE_DIR
+
+    scales = _activation_scales(model, tokenizer)
+    sens = _layer_sensitivity(model, scales)
+
+    ranked = sorted(sens.items(), key=lambda kv: kv[1], reverse=True)
+    protect = [idx for idx, _ in ranked[:N_PROTECT]]
+    print(f"layer sensitivity (worst first): {[(i, round(v, 1)) for i, v in ranked[:8]]}")
+    print(f"protecting layers in bf16: {sorted(protect)}")
 
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    skip = [f"model.layers.{i}" for i in protect]
     return AutoModelForCausalLM.from_pretrained(
         MODEL_CACHE_DIR,
         quantization_config=BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
+            llm_int8_skip_modules=skip,
         ),
         device_map="auto",
     )
