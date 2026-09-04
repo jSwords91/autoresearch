@@ -28,11 +28,21 @@ t_start = time.time()
 # ---------------------------------------------------------------------------
 
 def compress(model, tokenizer):
-    """
-    Baseline: no-op. Returns the model unchanged. The very first experiment
-    must be run with this untouched — it establishes the baseline row in
-    results.tsv (compression_ratio == 1.0, quality_gate == PASS by definition).
-    """
+    """8-bit weight quantization via bitsandbytes. bnb quantizes at load
+    time (not via a from-float conversion of an already-materialized bf16
+    model), so this reloads from the cached baseline checkpoint with a
+    BitsAndBytesConfig instead of transforming the passed-in model."""
+    from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+    from prepare import MODEL_CACHE_DIR
+
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    quant_config = BitsAndBytesConfig(load_in_8bit=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_CACHE_DIR, quantization_config=quant_config, device_map="auto"
+    )
     return model
 
 
