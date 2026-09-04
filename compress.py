@@ -49,7 +49,7 @@ t_start = time.time()
 # so it is the one plain AWQ implementations usually skip.
 
 ALPHA = 0.25
-SCALE_DOWN_PROJ = True
+SCALE_DOWN_PROJ = False
 DOUBLE_QUANT = True
 
 
@@ -152,7 +152,7 @@ def compress(model, tokenizer):
         tmp,
         quantization_config=BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_quant_type="fp4",
+            bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=DOUBLE_QUANT,
         ),
