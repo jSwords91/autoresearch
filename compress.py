@@ -29,12 +29,25 @@ t_start = time.time()
 # ---------------------------------------------------------------------------
 
 def compress(model, tokenizer):
-    """
-    Baseline: no-op. Returns the model unchanged. The very first experiment
-    must be run with this untouched - it establishes the baseline row in
-    results.tsv (compression_ratio 1.0, perfect agreement by definition).
-    """
-    return model
+    """4-bit NF4 weight quantization via bitsandbytes. Reference point for
+    the branch: 2.6x smaller and ~4x faster than 8-bit, whose only defect
+    under the new eval was a single repetition loop."""
+    from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+    from prepare import MODEL_CACHE_DIR
+
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return AutoModelForCausalLM.from_pretrained(
+        MODEL_CACHE_DIR,
+        quantization_config=BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        ),
+        device_map="auto",
+    )
 
 
 # ---------------------------------------------------------------------------
